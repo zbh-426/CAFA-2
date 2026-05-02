@@ -119,13 +119,15 @@ def build_messages(description: str) -> list[dict]:
 
 # CAFA-LMSTUDIO-CHANGE START
 # LM Studio exposes an OpenAI-compatible /v1/chat/completions endpoint.
-# Keep the code plain: no client class, only small helpers used by call_llm().
+# This follows the same plain pattern as lmstudio.py:
+#   OpenAI(base_url="http://localhost:1234/v1", api_key="lm-studio")
+#   client.chat.completions.create(..., response_format={"type": "json_schema", ...})
+# No wrapper class is used, so the request payload is easy to inspect/debug.
 
 CAFA_FORMULATION_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
         "name": "cafa_formulation",
-        "strict": True,
         "schema": {
             "type": "object",
             "properties": {
@@ -166,32 +168,91 @@ CAFA_FORMULATION_SCHEMA = {
 }
 
 
+def resolve_api_settings(
+    backend: str = "lmstudio",
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Resolve endpoint/key while keeping LM Studio as the local default."""
+    if backend == "lmstudio":
+        final_url = (
+            api_url
+            or os.getenv("LMSTUDIO_API_URL")
+            or os.getenv("API_URL")
+            or "http://localhost:1234/v1"
+        )
+        final_key = (
+            api_key
+            or os.getenv("LMSTUDIO_API_KEY")
+            or os.getenv("API_KEY")
+            or "lm-studio"
+        )
+        return final_url, final_key
+
+    # OpenAI-compatible remote backend. base_url is optional for the official OpenAI API.
+    final_url = api_url or os.getenv("OPENAI_BASE_URL") or os.getenv("API_URL") or None
+    final_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or ""
+    return final_url, final_key
+
+
+def build_response_format(json_mode: str = "auto", backend: str = "lmstudio") -> Optional[dict]:
+    """Return the response_format payload used by chat.completions.create()."""
+    if json_mode == "none":
+        return None
+    if json_mode == "json_object":
+        return {"type": "json_object"}
+
+    # For LM Studio, auto should use the JSON schema style shown in lmstudio.py.
+    # For OpenAI-compatible APIs, json_schema is also a valid structured-output mode.
+    if json_mode in {"auto", "json_schema"}:
+        return CAFA_FORMULATION_SCHEMA
+
+    raise ValueError(f"Unsupported json_mode: {json_mode}")
+
+
 def call_llm(
     model: str,
     messages: list[dict],
-    temperature=0.0,
+    temperature: float = 0.0,
     max_tokens: int = 4096,
-    base_url: Optional[str] = "http://localhost:1234/v1",
-    api_key: Optional[str] = "lm-studio",
+    backend: str = "lmstudio",
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    json_mode: str = "auto",
+    timeout: int = 120,
+    max_retries: int = 3,
 ) -> str:
-    """One OpenAI-compatible chat call. Returns raw text."""
+    """One OpenAI-compatible chat call. Returns raw model content."""
     from openai import OpenAI
 
-    client = OpenAI(base_url=base_url, api_key=api_key)
+    base_url, final_key = resolve_api_settings(backend=backend, api_url=api_url, api_key=api_key)
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=False,
-            response_format=CAFA_FORMULATION_SCHEMA
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        raise RuntimeError(f"LLM request failed: {e}")
-    
+    client_kwargs = {"api_key": final_key, "timeout": timeout}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = OpenAI(**client_kwargs)
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    response_format = build_response_format(json_mode=json_mode, backend=backend)
+    if response_format is not None:
+        payload["response_format"] = response_format
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(**payload)
+            return resp.choices[0].message.content or ""
+        except Exception as e:
+            last_error = e
+            if attempt == max_retries:
+                break
+    raise RuntimeError(f"LLM request failed after {max_retries} attempt(s): {last_error}")
 
 # CAFA-LMSTUDIO-CHANGE END
 
@@ -293,16 +354,33 @@ def needs_verification(result: dict) -> bool:
     return False
 
 
-def verify(description: str, formulation: dict, result: dict, model: str) -> Optional[dict]:
+def verify(
+    description: str,
+    formulation: dict,
+    result: dict,
+    model: str,
+    backend: str = "lmstudio",
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    json_mode: str = "auto",
+    timeout: int = 120,
+    max_retries: int = 3,
+) -> Optional[dict]:
     """One verifier pass. Returns revised formulation dict, or None."""
     user = (f"PROBLEM:\n{description}\n\n"
             f"FORMULATION:\n{json.dumps(formulation, indent=2)}\n\n"
             f"EXECUTOR: status={result['status']} obj={result['obj_val']} error={result['error']}")
     try:
-        # CAFA-LMSTUDIO-CHANGE: pass the same backend/json settings to verifier calls.
+        # CAFA-LMSTUDIO-CHANGE: verifier uses the same LM Studio/json-schema settings.
         raw = call_llm(
             model=model,
             messages=[{"role": "system", "content": VERIFIER_PROMPT}, {"role": "user", "content": user}],
+            backend=backend,
+            api_url=api_url,
+            api_key=api_key,
+            json_mode=json_mode,
+            timeout=timeout,
+            max_retries=max_retries,
         )
     except Exception:
         return None
@@ -315,7 +393,7 @@ def verify(description: str, formulation: dict, result: dict, model: str) -> Opt
 
 def solve(description: str, ground_truth: float, model: str,
           enable_verifier: bool, code_path: Optional[str],
-          backend: str = "openai", api_url: Optional[str] = None, api_key: Optional[str] = None,
+          backend: str = "lmstudio", api_url: Optional[str] = None, api_key: Optional[str] = None,
           json_mode: str = "auto", timeout: int = 120, max_retries: int = 3) -> dict:
     """Run the full pipeline for one problem. Returns a record dict."""
     rec = {"description": description, "ground_truth": ground_truth,
@@ -325,9 +403,16 @@ def solve(description: str, ground_truth: float, model: str,
 
     # 1. primary call
     try:
-        # CAFA-LMSTUDIO-CHANGE: backend/json options are threaded through the original pipeline.
+        # CAFA-LMSTUDIO-CHANGE: correct argument order and pass LM Studio/json-schema options.
         rec["raw"] = call_llm(
-            build_messages(description), model=model, 
+            model=model,
+            messages=build_messages(description),
+            backend=backend,
+            api_url=api_url,
+            api_key=api_key,
+            json_mode=json_mode,
+            timeout=timeout,
+            max_retries=max_retries,
         )
     except Exception as e:
         rec["status"], rec["error"] = "llm_fail", str(e)
@@ -346,7 +431,11 @@ def solve(description: str, ground_truth: float, model: str,
 
     # 3. optional verify (only if suspicious)
     if enable_verifier and needs_verification(res):
-        revised = verify(description, formulation, res, model=model)
+        revised = verify(
+            description, formulation, res, model=model,
+            backend=backend, api_url=api_url, api_key=api_key,
+            json_mode=json_mode, timeout=timeout, max_retries=max_retries,
+        )
         if revised and revised["code"] != formulation["code"]:
             res2 = execute_code(revised["code"], save_path=code_path)
             # accept only if strictly better
@@ -422,16 +511,16 @@ def print_report(s: dict) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset",     required=True)
-    p.add_argument("--model",       default="lmstudio-community/qwen/qwen3-4b-2507")
+    p.add_argument("--model",       default="qwen3-4b-instruct-2507")
     p.add_argument("--output_dir",  default="outputs")
-    p.add_argument("--no_verifier", action="store_false")
-    p.add_argument("--tolerance",   type=float, default=0.05)
+    p.add_argument("--no_verifier", dest="enable_verifier", action="store_false", default=False)
+    p.add_argument("--tolerance",   type=float, default=1e-4)
     p.add_argument("--limit",       type=int,   default=None)
 
     # CAFA-LMSTUDIO-CHANGE START
     # Minimal backend switches. LM Studio uses the OpenAI-compatible local server.
     p.add_argument("--backend", choices=["openai", "lmstudio"],
-                   default=os.getenv("CAFA_BACKEND", "openai"))
+                   default=os.getenv("CAFA_BACKEND", "lmstudio"))
     p.add_argument("--api_url", default=None,
                    help="Override API base URL. For LM Studio, default is http://localhost:1234/v1.")
     p.add_argument("--api_key", default=None,
@@ -467,7 +556,7 @@ def main() -> int:
             print(f"[{i:03d}] solving ...", flush=True)
             rec = solve(
                 desc, gt, args.model,
-                enable_verifier=not args.no_verifier, code_path=code_path,
+                enable_verifier=args.enable_verifier, code_path=code_path,
                 backend=args.backend, api_url=args.api_url, api_key=args.api_key,
                 json_mode=args.json_mode, timeout=args.timeout, max_retries=args.max_retries,
             )
@@ -476,7 +565,7 @@ def main() -> int:
         records.append(rec)
 
     summary = aggregate(records, tol=args.tolerance)
-    summary["verifier_enabled"] = not args.no_verifier
+    summary["verifier_enabled"] = args.enable_verifier
     print_report(summary)
     with open(os.path.join(base, "_metrics.json"), "w") as f: json.dump(summary, f, indent=2)
     return 0
