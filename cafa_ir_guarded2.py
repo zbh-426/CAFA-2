@@ -2,15 +2,16 @@
 CAFA++ pass1-lite - compact LM Studio auto-formulation with deterministic IR compiler.
 
 Pipeline:
-  description -> LLM structured JSON -> parse CAFA-IR-lite
+  description -> LLM evidence-bound structured JSON -> parse CAFA-IR-lite
+              -> build CAFA-AST -> semantic accounting checks
               -> deterministic expression-to-Gurobi compiler -> execute Gurobi -> metrics
 
 Design choice:
   To recover the strong behavior of the original CAFA prompt, the LLM still emits the familiar
-  CAFA JSON fields: variables, objective, constraints, and a code string.  However, in this
-  pass1-lite compiler version, the generated code is treated only as a scaffold/debug hint and is
-  NOT executed.  The executable Gurobi program is generated deterministically from objective and
-  constraints.
+  CAFA JSON fields: variables, objective, constraints, and a code string.  This version adds
+  evidence binding, objective_terms, CAFA-AST, and semantic accounting checks.  The generated
+  code is still treated only as a scaffold/debug hint and is NOT executed.  The executable Gurobi
+  program is generated deterministically from objective and constraints.
 
 Usage:
   python cafa_local_lmstudio.py --dataset bench.jsonl --model qwen3-4b-instruct-2507 \
@@ -36,17 +37,22 @@ from typing import Any, Optional
 # Keep the old CAFA schema/prompt shape because Qwen3-4B is already good at it.
 # The only architectural change is downstream: code is NOT executed; expressions are compiled.
 
-SYSTEM_PROMPT = """You are an expert OR modeler. Convert the problem into a compact CAFA-IR JSON.
+SYSTEM_PROMPT = """You are an expert OR modeler. Convert the problem into an evidence-bound compact CAFA-IR JSON.
 
-The JSON should look like the original CAFA formulation JSON. It includes a code field only as a
-modeling scaffold, but the downstream system will compile objective/constraints deterministically.
+The JSON keeps the familiar CAFA formulation fields so small local models can still behave like the
+original CAFA prompt. However, every formal element must now be linked to textual evidence, and the
+code field is only a scaffold/debug hint. The downstream system compiles objective/constraints
+deterministically and does NOT execute the model-written code.
 
 Reason in this order:
-  1. Identify decision variables. Pick INTEGER for indivisible counts, CONTINUOUS for divisible
-     quantities (acres, kg, hours, money, volume), BINARY for yes/no. Match real-world meaning.
-  2. Extract the objective. Watch for hidden coefficients.
-  3. Extract every constraint. Watch directions: at most/no more than -> <=, at least/no less than -> >=.
-  4. Self-check: every number used? all directions correct? variable types real-world correct?
+  1. Build an evidence table: short text clauses from the problem, each with an id such as E1, E2.
+  2. Identify decision variables. Pick INTEGER for indivisible counts, CONTINUOUS for divisible
+     quantities (acres, kg, hours, money, volume), BINARY for yes/no. Attach evidence_ids.
+  3. Extract objective terms. For every coefficient, attach evidence_ids showing where the coefficient
+     and its meaning came from.
+  4. Extract constraints. For every constraint, attach evidence_ids that justify LHS coefficients,
+     RHS number, and inequality direction.
+  5. Self-check: every important number used? all directions correct? variable types justified?
 
 Targeted semantic guardrails for NL4OPT-style cases:
   - at most / no more than / cannot exceed / limited to / up to / available means <=.
@@ -59,31 +65,58 @@ Targeted semantic guardrails for NL4OPT-style cases:
     amounts are usually CONTINUOUS unless the text explicitly asks for indivisible items.
   - Do not invent equality constraints unless the text says exactly, equal to, or must meet exactly.
   - If the question asks how many of each item/product/container to make, usually use INTEGER.
-  - Every important number in the question should appear in the objective, a constraint, or a bound.
+  - Every important number in the question should appear in the objective, a constraint, a bound,
+    or the evidence table with a clear role.
 
 Output STRICT JSON only, matching this schema. No prose, no markdown fences:
 {
   "problem_type": "LP" | "MILP" | "IP" | "BIP",
   "sense": "MAXIMIZE" | "MINIMIZE",
-  "variables": [{"name": "...", "vtype": "CONTINUOUS"|"INTEGER"|"BINARY", "rationale": "..."}],
+  "evidence": [
+    {"id": "E1", "text": "exact or short clause from problem", "numbers": [46], "role": "resource_coefficient | capacity | objective_coefficient | bound | ratio | variable | sense | other"}
+  ],
+  "variables": [
+    {"name": "...", "vtype": "CONTINUOUS"|"INTEGER"|"BINARY", "rationale": "...", "evidence_ids": ["E1"]}
+  ],
   "objective": "linear expression using short symbols such as x, y, z",
-  "constraints": [{"expression": "lhs <= rhs", "source": "clause from problem"}],
+  "objective_terms": [
+    {"var": "x", "coef": 10, "evidence_ids": ["E5"], "source": "profit per unit is 10"}
+  ],
+  "constraints": [
+    {"expression": "lhs <= rhs", "source": "clause from problem", "evidence_ids": ["E1", "E2", "E3"]}
+  ],
   "code": "Gurobi Python using existing model `m`; this is a scaffold and should match the JSON expressions"
 }
 
 Expression rules:
-  - Use the same symbols in objective, constraints, and code.
+  - Use the same symbols in objective, objective_terms, constraints, and code.
   - Use explicit <= or >=, never bare < or >.
   - Keep expressions linear. Do not use min(), max(), abs(), if, loops, or nonlinear terms.
   - Ratio constraints can be written naturally, e.g. y <= 2*x.
+
+Evidence rules:
+  - Every variable should have evidence_ids.
+  - Every objective term should have evidence_ids.
+  - Every constraint should have evidence_ids.
+  - The evidence text for a coefficient/RHS should include that number when possible.
+  - The evidence text for a direction should include words such as available, at most, at least, minimum, maximum, exactly, or demand.
 
 Code rules for the code field: assume gurobipy as gp and model m exist. Use m.addVar / m.setObjective / m.addConstr.
 No imports, no env, no m.optimize(), no comments."""
 
 
-VERIFIER_PROMPT = ("Review the formulation against the problem. Look for: wrong inequality direction, "
-                   "swapped coefficients, missing constraint, wrong variable type. "
-                   "Return the SAME JSON schema. If correct, return it unchanged. If wrong, fix it.")
+VERIFIER_PROMPT = """You are a semantic alignment verifier for evidence-bound CAFA-IR.
+
+Review the formulation against the problem. Focus on semantic binding, not syntax:
+  - wrong inequality direction
+  - swapped coefficients between variables
+  - missing resource/demand/ratio constraint
+  - wrong variable type
+  - coefficient/RHS not supported by evidence
+  - evidence_ids pointing to irrelevant text
+
+Return the SAME JSON schema as the generator. If correct, return it unchanged. If wrong, patch only the minimal wrong fields.
+Output STRICT JSON only, no prose, no markdown fences."""
 
 
 FEW_SHOT = [
@@ -93,15 +126,34 @@ FEW_SHOT = [
               "1345g A, 346g B, 1643g C. Profit: $10/Oil Max, $15/Oil Max Pro. Maximize profit."),
         "a": {
             "problem_type": "IP", "sense": "MAXIMIZE",
+            "evidence": [
+                {"id": "E1", "text": "Oil Max uses 46g of A", "numbers": [46], "role": "resource_coefficient"},
+                {"id": "E2", "text": "Oil Max Pro uses 13g of A", "numbers": [13], "role": "resource_coefficient"},
+                {"id": "E3", "text": "Available: 1345g A", "numbers": [1345], "role": "capacity"},
+                {"id": "E4", "text": "Oil Max uses 43g of B", "numbers": [43], "role": "resource_coefficient"},
+                {"id": "E5", "text": "Oil Max Pro uses 4g of B", "numbers": [4], "role": "resource_coefficient"},
+                {"id": "E6", "text": "Available: 346g B", "numbers": [346], "role": "capacity"},
+                {"id": "E7", "text": "Oil Max uses 56g of C", "numbers": [56], "role": "resource_coefficient"},
+                {"id": "E8", "text": "Oil Max Pro uses 45g of C", "numbers": [45], "role": "resource_coefficient"},
+                {"id": "E9", "text": "Available: 1643g C", "numbers": [1643], "role": "capacity"},
+                {"id": "E10", "text": "Profit: $10/Oil Max", "numbers": [10], "role": "objective_coefficient"},
+                {"id": "E11", "text": "Profit: $15/Oil Max Pro", "numbers": [15], "role": "objective_coefficient"},
+                {"id": "E12", "text": "containers are indivisible", "numbers": [], "role": "variable"},
+                {"id": "E13", "text": "Maximize profit", "numbers": [], "role": "sense"}
+            ],
             "variables": [
-                {"name": "Oil Max",     "vtype": "INTEGER", "rationale": "containers are indivisible"},
-                {"name": "Oil Max Pro", "vtype": "INTEGER", "rationale": "containers are indivisible"},
+                {"name": "Oil Max",     "vtype": "INTEGER", "rationale": "containers are indivisible", "evidence_ids": ["E12"]},
+                {"name": "Oil Max Pro", "vtype": "INTEGER", "rationale": "containers are indivisible", "evidence_ids": ["E12"]},
             ],
             "objective": "10*x + 15*y",
+            "objective_terms": [
+                {"var": "x", "coef": 10, "evidence_ids": ["E10"], "source": "Profit: $10/Oil Max"},
+                {"var": "y", "coef": 15, "evidence_ids": ["E11"], "source": "Profit: $15/Oil Max Pro"}
+            ],
             "constraints": [
-                {"expression": "46*x + 13*y <= 1345", "source": "substance A"},
-                {"expression": "43*x + 4*y <= 346",   "source": "substance B"},
-                {"expression": "56*x + 45*y <= 1643", "source": "substance C"},
+                {"expression": "46*x + 13*y <= 1345", "source": "substance A availability", "evidence_ids": ["E1", "E2", "E3"]},
+                {"expression": "43*x + 4*y <= 346",   "source": "substance B availability", "evidence_ids": ["E4", "E5", "E6"]},
+                {"expression": "56*x + 45*y <= 1643", "source": "substance C availability", "evidence_ids": ["E7", "E8", "E9"]},
             ],
             "code": ('x = m.addVar(name="Oil Max", vtype=gp.GRB.INTEGER)\n'
                      'y = m.addVar(name="Oil Max Pro", vtype=gp.GRB.INTEGER)\n'
@@ -117,16 +169,30 @@ FEW_SHOT = [
               "Maximize profit."),
         "a": {
             "problem_type": "LP", "sense": "MAXIMIZE",
+            "evidence": [
+                {"id": "E1", "text": "50 acres available", "numbers": [50], "role": "capacity"},
+                {"id": "E2", "text": "minimum 5 acres apples", "numbers": [5], "role": "bound"},
+                {"id": "E3", "text": "minimum 10 acres pears", "numbers": [10], "role": "bound"},
+                {"id": "E4", "text": "Profit $2/acre apples", "numbers": [2], "role": "objective_coefficient"},
+                {"id": "E5", "text": "Profit $4/acre pears", "numbers": [4], "role": "objective_coefficient"},
+                {"id": "E6", "text": "at most twice as many pears as apples", "numbers": [2], "role": "ratio"},
+                {"id": "E7", "text": "acres are divisible quantities", "numbers": [], "role": "variable"},
+                {"id": "E8", "text": "Maximize profit", "numbers": [], "role": "sense"}
+            ],
             "variables": [
-                {"name": "apples", "vtype": "CONTINUOUS", "rationale": "acreage is divisible"},
-                {"name": "pears",  "vtype": "CONTINUOUS", "rationale": "acreage is divisible"},
+                {"name": "apples", "vtype": "CONTINUOUS", "rationale": "acreage is divisible", "evidence_ids": ["E7"]},
+                {"name": "pears",  "vtype": "CONTINUOUS", "rationale": "acreage is divisible", "evidence_ids": ["E7"]},
             ],
             "objective": "2*x + 4*y",
+            "objective_terms": [
+                {"var": "x", "coef": 2, "evidence_ids": ["E4"], "source": "Profit $2/acre apples"},
+                {"var": "y", "coef": 4, "evidence_ids": ["E5"], "source": "Profit $4/acre pears"}
+            ],
             "constraints": [
-                {"expression": "x + y <= 50", "source": "total acres"},
-                {"expression": "x >= 5",       "source": "apple minimum"},
-                {"expression": "y >= 10",      "source": "pear minimum"},
-                {"expression": "y <= 2*x",     "source": "pear-to-apple ratio"},
+                {"expression": "x + y <= 50", "source": "total acres available", "evidence_ids": ["E1"]},
+                {"expression": "x >= 5",       "source": "apple minimum", "evidence_ids": ["E2"]},
+                {"expression": "y >= 10",      "source": "pear minimum", "evidence_ids": ["E3"]},
+                {"expression": "y <= 2*x",     "source": "pear-to-apple ratio", "evidence_ids": ["E6"]},
             ],
             "code": ('x = m.addVar(name="apples", vtype=gp.GRB.CONTINUOUS)\n'
                      'y = m.addVar(name="pears", vtype=gp.GRB.CONTINUOUS)\n'
@@ -161,12 +227,27 @@ def build_messages(description: str) -> list[dict]:
 CAFA_FORMULATION_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "cafa_ir_lite_formulation",
+        "name": "cafa_ir_evidence_formulation",
         "schema": {
             "type": "object",
             "properties": {
                 "problem_type": {"type": "string", "enum": ["LP", "MILP", "IP", "BIP"]},
                 "sense": {"type": "string", "enum": ["MAXIMIZE", "MINIMIZE"]},
+                # CAFA-EVIDENCE-CHANGE: evidence table is model-facing, but parser remains tolerant.
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "text": {"type": "string"},
+                            "numbers": {"type": "array", "items": {"type": "number"}},
+                            "role": {"type": "string"},
+                        },
+                        "required": ["id", "text", "numbers", "role"],
+                        "additionalProperties": False,
+                    },
+                },
                 "variables": {
                     "type": "array",
                     "items": {
@@ -175,12 +256,27 @@ CAFA_FORMULATION_SCHEMA = {
                             "name": {"type": "string"},
                             "vtype": {"type": "string", "enum": ["CONTINUOUS", "INTEGER", "BINARY"]},
                             "rationale": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["name", "vtype", "rationale"],
+                        "required": ["name", "vtype", "rationale", "evidence_ids"],
                         "additionalProperties": False,
                     },
                 },
                 "objective": {"type": "string"},
+                "objective_terms": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "var": {"type": "string"},
+                            "coef": {"type": "number"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                            "source": {"type": "string"},
+                        },
+                        "required": ["var", "coef", "evidence_ids", "source"],
+                        "additionalProperties": False,
+                    },
+                },
                 "constraints": {
                     "type": "array",
                     "items": {
@@ -188,14 +284,18 @@ CAFA_FORMULATION_SCHEMA = {
                         "properties": {
                             "expression": {"type": "string"},
                             "source": {"type": "string"},
+                            "evidence_ids": {"type": "array", "items": {"type": "string"}},
                         },
-                        "required": ["expression", "source"],
+                        "required": ["expression", "source", "evidence_ids"],
                         "additionalProperties": False,
                     },
                 },
                 "code": {"type": "string"},
             },
-            "required": ["problem_type", "sense", "variables", "objective", "constraints", "code"],
+            "required": [
+                "problem_type", "sense", "evidence", "variables", "objective",
+                "objective_terms", "constraints", "code"
+            ],
             "additionalProperties": False,
         },
     },
@@ -358,11 +458,95 @@ def parse_formulation(raw: str) -> Optional[dict]:
         return None
 
 
-def parse_ir_lite(raw: str) -> dict:
-    """Parse model output into a normalized IR-lite dict.
 
-    This is intentionally forgiving. If the JSON is valid and has objective/constraints,
-    parser success should be high; algebra problems are left for compile_fail diagnostics.
+def _clean_evidence_id(eid: Any, fallback: str) -> str:
+    eid_s = str(eid or fallback).strip()
+    eid_s = re.sub(r"\W+", "_", eid_s).strip("_")
+    return eid_s or fallback
+
+
+def _normalize_evidence_table(data: dict) -> list[dict]:
+    """Normalize optional evidence table.
+
+    CAFA-EVIDENCE-CHANGE:
+    The JSON schema asks the model to provide evidence, but this parser stays
+    tolerant so older cached outputs or occasional weak-model omissions do not
+    become parse failures. Missing evidence IDs are patched with synthetic
+    source-derived evidence below.
+    """
+    evidence: list[dict] = []
+    seen: set[str] = set()
+    raw_items = data.get("evidence", [])
+    if not isinstance(raw_items, list):
+        raw_items = []
+    for i, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        eid = _clean_evidence_id(item.get("id"), f"E{i+1}")
+        if eid in seen:
+            eid = f"{eid}_{i+1}"
+        seen.add(eid)
+        text = str(item.get("text", "")).strip()
+        nums = item.get("numbers", [])
+        if not isinstance(nums, list):
+            nums = []
+        clean_nums: list[float] = []
+        for n in nums:
+            try:
+                fn = float(n)
+            except Exception:
+                continue
+            if math.isfinite(fn):
+                clean_nums.append(fn)
+        if not clean_nums and text:
+            clean_nums = extract_numbers(text)
+        evidence.append({
+            "id": eid,
+            "text": text,
+            "numbers": clean_nums,
+            "role": str(item.get("role", "other")).strip() or "other",
+        })
+    return evidence
+
+
+def _ensure_synthetic_evidence(evidence: list[dict], text: str, role: str) -> str:
+    """Append a synthetic evidence item and return its id."""
+    eid = f"S{len(evidence) + 1}"
+    evidence.append({
+        "id": eid,
+        "text": str(text or "").strip(),
+        "numbers": extract_numbers(text),
+        "role": role,
+    })
+    return eid
+
+
+def _normalize_evidence_ids(raw_ids: Any, evidence_ids: set[str], evidence: list[dict], fallback_text: str, role: str) -> list[str]:
+    if isinstance(raw_ids, list):
+        ids = [_clean_evidence_id(x, "") for x in raw_ids if str(x).strip()]
+    elif isinstance(raw_ids, str) and raw_ids.strip():
+        ids = [_clean_evidence_id(raw_ids, "")]
+    else:
+        ids = []
+
+    ids = [x for x in ids if x]
+    if not ids:
+        ids = [_ensure_synthetic_evidence(evidence, fallback_text, role)]
+        evidence_ids.add(ids[0])
+    return ids
+
+
+def parse_ir_lite(raw: str) -> dict:
+    """Parse model output into normalized evidence-bound IR-lite.
+
+    CAFA-EVIDENCE-CHANGE:
+    New fields are preserved when present:
+      - evidence table
+      - variable evidence_ids
+      - objective_terms with evidence_ids
+      - constraint evidence_ids
+    The compiler still uses objective/constraint expressions, keeping the main
+    architecture unchanged.
     """
     data = _extract_json_object(raw)
     if not isinstance(data, dict):
@@ -385,9 +569,11 @@ def parse_ir_lite(raw: str) -> dict:
     if not isinstance(data.get("objective"), str) or not data["objective"].strip():
         raise IRValidationError("objective must be a non-empty string")
 
+    evidence = _normalize_evidence_table(data)
+    evidence_id_set = {e["id"] for e in evidence}
+
     symbols = extract_symbol_order(data)
     if not symbols:
-        # Last-resort fallback: create x, y, z by variable count. Compiler will fail if expressions are unusable.
         default = ["x", "y", "z", "w", "u", "v"]
         symbols = default[: len(data["variables"])]
 
@@ -397,17 +583,48 @@ def parse_ir_lite(raw: str) -> dict:
         vid = str(src.get("id") or sym).strip()
         if not IDENT_RE.match(vid):
             vid = sym
-        # Use expression symbol as the compiler id; keep src id only if it equals the expression symbol.
         vid = sym if IDENT_RE.match(sym) else vid
         vtype = str(src.get("vtype", "CONTINUOUS")).strip().upper()
         if vtype not in VALID_VTYPES:
             vtype = "CONTINUOUS"
+        name = str(src.get("name") or vid).strip()
+        rationale = str(src.get("rationale", "")).strip()
+        eids = _normalize_evidence_ids(
+            src.get("evidence_ids"), evidence_id_set, evidence,
+            fallback_text=(rationale or name), role="variable",
+        )
         clean_vars.append({
             "id": vid,
-            "name": str(src.get("name") or vid).strip(),
+            "name": name,
             "vtype": vtype,
-            "rationale": str(src.get("rationale", "")).strip(),
+            "rationale": rationale,
+            "evidence_ids": eids,
         })
+
+    clean_objective_terms: list[dict] = []
+    raw_terms = data.get("objective_terms", [])
+    if isinstance(raw_terms, list):
+        for i, t in enumerate(raw_terms):
+            if not isinstance(t, dict):
+                continue
+            var = str(t.get("var", "")).strip()
+            if var and not IDENT_RE.match(var):
+                var = ""
+            try:
+                coef = float(t.get("coef"))
+            except Exception:
+                continue
+            source = str(t.get("source", "")).strip()
+            eids = _normalize_evidence_ids(
+                t.get("evidence_ids"), evidence_id_set, evidence,
+                fallback_text=(source or f"objective coefficient {coef:g} for {var}"), role="objective_coefficient",
+            )
+            clean_objective_terms.append({
+                "var": var,
+                "coef": coef,
+                "source": source,
+                "evidence_ids": eids,
+            })
 
     clean_constraints: list[dict] = []
     for idx, c in enumerate(data["constraints"]):
@@ -416,22 +633,30 @@ def parse_ir_lite(raw: str) -> dict:
         expr = normalize_expr(c.get("expression", ""))
         if not expr:
             continue
+        source = str(c.get("source", "")).strip()
+        eids = _normalize_evidence_ids(
+            c.get("evidence_ids"), evidence_id_set, evidence,
+            fallback_text=(source or expr), role="constraint",
+        )
         clean_constraints.append({
             "name": safe_constr_name(str(c.get("name", f"c{idx+1}")), idx),
             "expression": expr,
-            "source": str(c.get("source", "")).strip(),
+            "source": source,
+            "evidence_ids": eids,
         })
     if not clean_constraints:
         raise IRValidationError("no usable constraints")
 
     ir = {
-        "ir_version": "cafa-ir-lite-v2",
+        "ir_version": "cafa-ir-evidence-v1",
         "problem_type": problem_type,
         "sense": sense,
+        "evidence": evidence,
         "variables": clean_vars,
         "objective": normalize_expr(data["objective"]),
+        "objective_terms": clean_objective_terms,
         "constraints": clean_constraints,
-        "code_hint": str(data.get("code", "")),  # ignored by compiler; useful for debugging/model scaffold
+        "code_hint": str(data.get("code", "")),
     }
     return ir
 
@@ -535,6 +760,93 @@ def parse_constraint_expr(expr: str, var_ids: set[str]) -> tuple[dict[str, float
     rc, rk = parse_linear_expr(rhs, var_ids)
     coeffs, const = _merge((lc, lk), (rc, rk), scale_b=-1.0)  # lhs - rhs sense 0
     return coeffs, sense, -const
+
+
+# --------------------------------------------------------------------------- #
+# CAFA-AST builder
+# --------------------------------------------------------------------------- #
+
+# CAFA-AST-CHANGE START
+# The model-facing IR keeps expression strings for small-model robustness.
+# This AST is compiler/checker-facing: expressions are parsed once into canonical
+# terms, constants, senses, and evidence links.  Gurobi generation can continue
+# using the existing compiler, while semantic accounting uses this AST.
+
+
+def _linear_expr_to_ast(coeffs: dict[str, float], const: float) -> dict:
+    return {
+        "kind": "LinearExpr",
+        "constant": float(const),
+        "terms": [
+            {"var": var, "coef": float(coef)}
+            for var, coef in sorted(coeffs.items())
+            if abs(float(coef)) >= 1e-12
+        ],
+    }
+
+
+def build_cafa_ast(ir: dict) -> dict:
+    """Build canonical CAFA-AST from normalized evidence-bound IR."""
+    variables = ir.get("variables", []) if isinstance(ir.get("variables"), list) else []
+    var_ids = [str(v.get("id")) for v in variables if isinstance(v, dict) and v.get("id")]
+    var_set = set(var_ids)
+
+    obj_coeffs, obj_const = parse_linear_expr(str(ir.get("objective", "0")), var_set)
+    constraints_ast: list[dict] = []
+    for i, c in enumerate(ir.get("constraints", [])):
+        if not isinstance(c, dict):
+            continue
+        lhs_s, sense, rhs_s = split_constraint(str(c.get("expression", "")))
+        lhs_coeffs, lhs_const = parse_linear_expr(lhs_s, var_set)
+        rhs_coeffs, rhs_const = parse_linear_expr(rhs_s, var_set)
+        norm_coeffs, norm_sense, norm_rhs = parse_constraint_expr(str(c.get("expression", "")), var_set)
+        constraints_ast.append({
+            "kind": "LinearConstraint",
+            "name": c.get("name") or f"c{i+1}",
+            "expression": c.get("expression", ""),
+            "lhs": _linear_expr_to_ast(lhs_coeffs, lhs_const),
+            "sense": sense,
+            "rhs": _linear_expr_to_ast(rhs_coeffs, rhs_const),
+            "normalized": {
+                "lhs": _linear_expr_to_ast(norm_coeffs, 0.0),
+                "sense": norm_sense,
+                "rhs": float(norm_rhs),
+            },
+            "source": c.get("source", ""),
+            "evidence_ids": list(c.get("evidence_ids", [])),
+        })
+
+    return {
+        "kind": "Model",
+        "ast_version": "cafa-ast-evidence-v1",
+        "problem_type": ir.get("problem_type"),
+        "sense": ir.get("sense"),
+        "evidence": ir.get("evidence", []),
+        "variables": [
+            {
+                "kind": "Variable",
+                "id": v.get("id"),
+                "name": v.get("name"),
+                "vtype": v.get("vtype"),
+                "rationale": v.get("rationale", ""),
+                "lb": 0.0,
+                "ub": 1.0 if v.get("vtype") == "BINARY" else None,
+                "evidence_ids": list(v.get("evidence_ids", [])),
+            }
+            for v in variables
+            if isinstance(v, dict)
+        ],
+        "objective": {
+            "kind": "LinearObjective",
+            "sense": ir.get("sense"),
+            "raw": ir.get("objective", ""),
+            "expr": _linear_expr_to_ast(obj_coeffs, obj_const),
+            "terms_from_model": ir.get("objective_terms", []),
+        },
+        "constraints": constraints_ast,
+    }
+
+# CAFA-AST-CHANGE END
 
 
 def safe_py_name(var_id: str) -> str:
@@ -844,8 +1156,220 @@ def attach_suspicious_info(rec: dict, reasons: list[str]) -> None:
 # CAFA-SUSPICIOUS-CHECKS END
 
 
+
 # --------------------------------------------------------------------------- #
-# Verifier (kept as later-work hook; disabled by default)
+# Evidence-bound semantic accounting checks
+# --------------------------------------------------------------------------- #
+
+# CAFA-SEMANTIC-ACCOUNTING START
+# These checks are stricter than the broad suspicious flags.  They compare the
+# canonical AST against the evidence table and the original description.  They
+# still do not use ground truth.  Only HIGH-RISK accounting failures trigger the
+# verifier.
+
+
+def _evidence_map(ir_or_ast: dict) -> dict[str, dict]:
+    evidence = ir_or_ast.get("evidence", []) if isinstance(ir_or_ast, dict) else []
+    return {str(e.get("id")): e for e in evidence if isinstance(e, dict) and e.get("id")}
+
+
+def _evidence_text_for_ids(evidence_by_id: dict[str, dict], ids: list[str], extra: str = "") -> str:
+    texts = [str(evidence_by_id.get(str(eid), {}).get("text", "")) for eid in ids]
+    if extra:
+        texts.append(str(extra))
+    return " ".join(t for t in texts if t).strip()
+
+
+def _evidence_numbers_for_ids(evidence_by_id: dict[str, dict], ids: list[str], extra: str = "") -> list[float]:
+    nums: list[float] = []
+    for eid in ids:
+        ev = evidence_by_id.get(str(eid), {})
+        ev_nums = ev.get("numbers", []) if isinstance(ev, dict) else []
+        if isinstance(ev_nums, list):
+            for n in ev_nums:
+                try:
+                    fn = float(n)
+                except Exception:
+                    continue
+                if math.isfinite(fn):
+                    nums.append(fn)
+        nums.extend(extract_numbers(str(ev.get("text", ""))))
+    if extra:
+        nums.extend(extract_numbers(extra))
+    return nums
+
+
+def _number_supported(value: float, evidence_by_id: dict[str, dict], ids: list[str], extra: str = "") -> bool:
+    # 1 and -1 coefficients are often implicit, so do not require literal evidence.
+    if abs(abs(float(value)) - 1.0) < 1e-12:
+        return True
+    nums = _evidence_numbers_for_ids(evidence_by_id, ids, extra=extra)
+    return any(_num_close(float(value), n, rel=1e-7, abs_tol=1e-7) for n in nums)
+
+
+def _all_ast_numbers(ast_model: dict) -> list[float]:
+    nums: list[float] = []
+    obj = ast_model.get("objective", {}).get("expr", {})
+    nums.append(float(obj.get("constant", 0.0) or 0.0))
+    for t in obj.get("terms", []):
+        nums.append(float(t.get("coef", 0.0)))
+    for c in ast_model.get("constraints", []):
+        norm = c.get("normalized", {})
+        nums.append(float(norm.get("rhs", 0.0) or 0.0))
+        for t in norm.get("lhs", {}).get("terms", []):
+            nums.append(float(t.get("coef", 0.0)))
+    return [n for n in nums if math.isfinite(n) and abs(n) > 1e-12]
+
+
+def semantic_accounting_checks(
+    description: str,
+    ir: Optional[dict],
+    ast_model: Optional[dict],
+    result: Optional[dict] = None,
+) -> tuple[list[str], list[str]]:
+    """Return (all_reasons, high_risk_reasons) for semantic alignment."""
+    reasons: list[str] = []
+    high_risk: list[str] = []
+    if not isinstance(ir, dict) or not isinstance(ast_model, dict):
+        return ["semantic:no_ir_or_ast"], ["semantic:no_ir_or_ast"]
+
+    evidence_by_id = _evidence_map(ir)
+    known_ids = set(evidence_by_id)
+    desc_l = str(description).lower()
+
+    def add(reason: str, high: bool = False) -> None:
+        reasons.append(reason)
+        if high:
+            high_risk.append(reason)
+
+    # 0) Evidence ID existence checks.
+    for v in ir.get("variables", []):
+        ids = list(v.get("evidence_ids", [])) if isinstance(v, dict) else []
+        if not ids:
+            add(f"semantic:missing_variable_evidence_ids:{v.get('id') or v.get('name')}", high=True)
+        for eid in ids:
+            if str(eid) not in known_ids:
+                add(f"semantic:unknown_variable_evidence_id:{v.get('id') or v.get('name')}:{eid}", high=True)
+
+    for t in ir.get("objective_terms", []):
+        ids = list(t.get("evidence_ids", [])) if isinstance(t, dict) else []
+        if not ids:
+            add(f"semantic:missing_objective_term_evidence_ids:{t.get('var')}", high=True)
+        for eid in ids:
+            if str(eid) not in known_ids:
+                add(f"semantic:unknown_objective_evidence_id:{t.get('var')}:{eid}", high=True)
+
+    for i, c in enumerate(ir.get("constraints", [])):
+        ids = list(c.get("evidence_ids", [])) if isinstance(c, dict) else []
+        if not ids:
+            add(f"semantic:missing_constraint_evidence_ids:c{i+1}", high=True)
+        for eid in ids:
+            if str(eid) not in known_ids:
+                add(f"semantic:unknown_constraint_evidence_id:c{i+1}:{eid}", high=True)
+
+    # 1) Number-to-source check: important numbers in the problem should appear in AST expressions.
+    problem_nums = extract_numbers(description)
+    ast_nums = _all_ast_numbers(ast_model)
+    missing_problem_nums: list[float] = []
+    for n in problem_nums:
+        if not any(_num_close(n, m, rel=1e-7, abs_tol=1e-7) for m in ast_nums):
+            missing_problem_nums.append(n)
+    important_missing = [n for n in missing_problem_nums if abs(n) > 3]
+    if important_missing or len(missing_problem_nums) >= 3:
+        preview = ", ".join(f"{n:g}" for n in (important_missing or missing_problem_nums)[:6])
+        add(f"semantic:number_to_source:problem_numbers_missing_from_ast:[{preview}]", high=True)
+
+    # 2) Objective coefficient-to-source check.
+    model_terms = {
+        str(t.get("var")): t for t in ir.get("objective_terms", [])
+        if isinstance(t, dict) and t.get("var")
+    }
+    for term in ast_model.get("objective", {}).get("expr", {}).get("terms", []):
+        var = str(term.get("var"))
+        coef = float(term.get("coef", 0.0))
+        term_info = model_terms.get(var, {})
+        ids = list(term_info.get("evidence_ids", [])) if isinstance(term_info, dict) else []
+        source = str(term_info.get("source", "")) if isinstance(term_info, dict) else ""
+        if abs(coef) > 1e-12 and not _number_supported(coef, evidence_by_id, ids, extra=source):
+            add(f"semantic:coefficient_to_source:objective:{var}:{coef:g}_not_supported_by_evidence", high=True)
+
+    # 3) Constraint coefficient/RHS/direction-to-source checks.
+    for c in ast_model.get("constraints", []):
+        cname = str(c.get("name", "constraint"))
+        ids = list(c.get("evidence_ids", []))
+        source = str(c.get("source", ""))
+        ev_text = _evidence_text_for_ids(evidence_by_id, ids, extra=source)
+        ev_l = ev_text.lower()
+
+        # 3a) LHS coefficients.
+        for term in c.get("normalized", {}).get("lhs", {}).get("terms", []):
+            coef = float(term.get("coef", 0.0))
+            # Coefficients produced by moving RHS variable terms can be negative. Check abs value.
+            val = abs(coef)
+            if abs(val) > 1e-12 and not _number_supported(val, evidence_by_id, ids, extra=source):
+                add(f"semantic:coefficient_to_source:{cname}:{term.get('var')}:{coef:g}_not_supported_by_evidence", high=True)
+
+        # 3b) RHS number.
+        rhs = float(c.get("normalized", {}).get("rhs", 0.0) or 0.0)
+        if abs(rhs) > 1e-12 and not _number_supported(rhs, evidence_by_id, ids, extra=source):
+            add(f"semantic:rhs_to_source:{cname}:{rhs:g}_not_supported_by_evidence", high=True)
+
+        # 3c) Direction.
+        sense = str(c.get("sense"))
+        if _contains_any(ev_l, UPPER_BOUND_PHRASES) and sense not in {"<=", "=="}:
+            add(f"semantic:direction_to_source:{cname}:evidence_suggests_<=_but_ast_has_{sense}", high=True)
+        if _contains_any(ev_l, LOWER_BOUND_PHRASES) and sense not in {">=", "=="}:
+            add(f"semantic:direction_to_source:{cname}:evidence_suggests_>=_but_ast_has_{sense}", high=True)
+        if _contains_any(ev_l, EQUALITY_PHRASES) and sense != "==":
+            add(f"semantic:direction_to_source:{cname}:evidence_suggests_==_but_ast_has_{sense}", high=True)
+
+    # 4) Variable-type-to-source check.
+    desc_has_discrete = _contains_any(desc_l, DISCRETE_NOUNS) or "how many" in desc_l
+    for v in ast_model.get("variables", []):
+        ids = list(v.get("evidence_ids", []))
+        ev_text = _evidence_text_for_ids(evidence_by_id, ids, extra=f"{v.get('name', '')} {v.get('rationale', '')}").lower()
+        vtype = str(v.get("vtype", "")).upper()
+        vid = v.get("id") or v.get("name")
+        if vtype == "CONTINUOUS" and (_contains_any(ev_text, DISCRETE_NOUNS) or (desc_has_discrete and not _contains_any(ev_text, CONTINUOUS_NOUNS))):
+            add(f"semantic:variable_type_to_source:{vid}:count_like_evidence_but_CONTINUOUS", high=True)
+        if vtype in {"INTEGER", "BINARY"} and _contains_any(ev_text, CONTINUOUS_NOUNS) and not _contains_any(ev_text, DISCRETE_NOUNS):
+            add(f"semantic:variable_type_to_source:{vid}:divisible_evidence_but_{vtype}", high=True)
+
+    # 5) Solver status remains high-risk.
+    if isinstance(result, dict) and result.get("status") not in {None, "ok"}:
+        add(f"semantic:solver_status:{result.get('status')}:{result.get('error')}", high=True)
+
+    # Deduplicate while preserving order.
+    def dedupe(xs: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in xs:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    return dedupe(reasons), dedupe(high_risk)
+
+
+def attach_semantic_accounting_info(rec: dict, reasons: list[str], high_risk: list[str]) -> None:
+    rec["semantic_reasons"] = reasons
+    rec["semantic_high_risk_reasons"] = high_risk
+    rec["semantic_high_risk"] = bool(high_risk)
+    rec["semantic_score"] = len(reasons)
+    rec["semantic_high_risk_score"] = len(high_risk)
+
+
+def needs_semantic_verification(result: dict, rec: dict) -> bool:
+    """Verifier trigger: only solver failures or high-risk semantic accounting failures."""
+    if needs_verification(result):
+        return True
+    return bool(rec.get("semantic_high_risk"))
+
+# CAFA-SEMANTIC-ACCOUNTING END
+
+# --------------------------------------------------------------------------- #
+# Verifier (semantic high-risk gated)
 # --------------------------------------------------------------------------- #
 
 def needs_verification(result: dict) -> bool:
@@ -867,10 +1391,13 @@ def verify(
     json_mode: str = "auto",
     timeout: int = 120,
     max_retries: int = 3,
+    semantic_report: Optional[dict] = None,
 ) -> Optional[dict]:
     """One verifier pass. Returns revised formulation dict, or None."""
+    report_text = json.dumps(semantic_report or {}, indent=2, ensure_ascii=False)
     user = (f"PROBLEM:\n{description}\n\n"
-            f"FORMULATION:\n{json.dumps(formulation, indent=2)}\n\n"
+            f"FORMULATION:\n{json.dumps(formulation, indent=2, ensure_ascii=False)}\n\n"
+            f"SEMANTIC_ACCOUNTING_REPORT:\n{report_text}\n\n"
             f"EXECUTOR: status={result['status']} obj={result['obj_val']} error={result['error']}")
     try:
         raw = call_llm(
@@ -899,6 +1426,7 @@ def solve(
     enable_verifier: bool,
     code_path: Optional[str],
     ir_path: Optional[str] = None,
+    ast_path: Optional[str] = None,
     backend: str = "lmstudio",
     api_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -913,6 +1441,7 @@ def solve(
         "raw": "",
         "formulation": None,
         "ir": None,
+        "ast": None,
         "code_used": None,
         "code_hint": None,
         "obj_val": None,
@@ -922,6 +1451,11 @@ def solve(
         "suspicious": False,
         "suspicious_score": 0,
         "suspicious_reasons": [],
+        "semantic_reasons": [],
+        "semantic_high_risk_reasons": [],
+        "semantic_high_risk": False,
+        "semantic_score": 0,
+        "semantic_high_risk_score": 0,
     }
 
     # 1. primary LM Studio call
@@ -950,35 +1484,61 @@ def solve(
     rec["ir"] = ir
     rec["formulation"] = ir  # backward-compatible key for old meta readers
     rec["code_hint"] = ir.get("code_hint")
-    # CAFA-SUSPICIOUS-CHECKS: semantic warnings are logged, not used for repair/selection.
+
+    # 3. CAFA-AST build from expressions.
+    # CAFA-AST-CHANGE: the AST is saved and used by semantic accounting.
+    try:
+        ast_model = build_cafa_ast(ir)
+    except Exception as e:
+        rec["status"], rec["error"] = "compile_fail", f"AST build failed: {e}"
+        attach_suspicious_info(rec, [f"compiler_status_suspicious:ast_build_failed: {e}"])
+        attach_semantic_accounting_info(rec, [f"semantic:ast_build_failed:{e}"], [f"semantic:ast_build_failed:{e}"])
+        return rec
+
+    rec["ast"] = ast_model
     attach_suspicious_info(rec, analyze_suspicious_case(description, ir))
+    sem_reasons, sem_high = semantic_accounting_checks(description, ir, ast_model)
+    attach_semantic_accounting_info(rec, sem_reasons, sem_high)
+
     if ir_path:
         os.makedirs(os.path.dirname(ir_path), exist_ok=True)
         with open(ir_path, "w", encoding="utf-8") as f:
             json.dump(ir, f, indent=2, ensure_ascii=False)
+    if ast_path:
+        os.makedirs(os.path.dirname(ast_path), exist_ok=True)
+        with open(ast_path, "w", encoding="utf-8") as f:
+            json.dump(ast_model, f, indent=2, ensure_ascii=False)
 
-    # 3. deterministic IR-lite -> Gurobi compiler
+    # 4. deterministic IR-lite -> Gurobi compiler
     try:
         code = compile_ir_to_gurobi(ir, save_path=code_path)
     except Exception as e:
         rec["status"], rec["error"] = "compile_fail", str(e)
         extra = [f"compiler_status_suspicious:compile_fail: {e}"]
         attach_suspicious_info(rec, rec.get("suspicious_reasons", []) + extra)
+        attach_semantic_accounting_info(rec, rec.get("semantic_reasons", []) + [f"semantic:compile_fail:{e}"], rec.get("semantic_high_risk_reasons", []) + [f"semantic:compile_fail:{e}"])
         return rec
 
     rec["code_used"] = code
 
-    # 4. execute compiled code
+    # 5. execute compiled code
     res = execute_code(code, save_path=code_path)
     rec.update(status=res["status"], obj_val=res["obj_val"], error=res["error"])
     attach_suspicious_info(rec, analyze_suspicious_case(description, ir, result=res))
+    sem_reasons, sem_high = semantic_accounting_checks(description, ir, ast_model, result=res)
+    attach_semantic_accounting_info(rec, sem_reasons, sem_high)
 
-    # 5. optional verifier, kept for future use and disabled by default
-    if enable_verifier and needs_verification(res):
+    # 6. optional verifier: now gated by HIGH-RISK semantic accounting failures.
+    if enable_verifier and needs_semantic_verification(res, rec):
         revised = verify(
             description, ir, res, model=model,
             backend=backend, api_url=api_url, api_key=api_key,
             json_mode=json_mode, timeout=timeout, max_retries=max_retries,
+            semantic_report={
+                "semantic_reasons": rec.get("semantic_reasons", []),
+                "semantic_high_risk_reasons": rec.get("semantic_high_risk_reasons", []),
+                "suspicious_reasons": rec.get("suspicious_reasons", []),
+            },
         )
         if revised:
             try:
@@ -991,11 +1551,21 @@ def solve(
                 or abs(res2["obj_val"] - ground_truth) < abs((res["obj_val"] or 0.0) - ground_truth)
             )
             if better:
+                revised_ast = build_cafa_ast(revised)
                 rec["ir"] = rec["formulation"] = revised
+                rec["ast"] = revised_ast
                 rec["code_hint"] = revised.get("code_hint")
                 rec["code_used"] = revised_code
                 rec.update(status=res2["status"], obj_val=res2["obj_val"], error=res2["error"])
                 attach_suspicious_info(rec, analyze_suspicious_case(description, revised, result=res2))
+                sem_reasons, sem_high = semantic_accounting_checks(description, revised, revised_ast, result=res2)
+                attach_semantic_accounting_info(rec, sem_reasons, sem_high)
+                if ir_path:
+                    with open(ir_path, "w", encoding="utf-8") as f:
+                        json.dump(revised, f, indent=2, ensure_ascii=False)
+                if ast_path:
+                    with open(ast_path, "w", encoding="utf-8") as f:
+                        json.dump(revised_ast, f, indent=2, ensure_ascii=False)
                 rec["revised"] = True
     return rec
 
@@ -1027,6 +1597,8 @@ def aggregate(records: list[dict], tol: float) -> dict:
     correct, revised, correct_ids = 0, 0, []
     suspicious, suspicious_correct, suspicious_wrong = 0, 0, 0
     suspicious_ids: list[int] = []
+    semantic_high_risk, semantic_high_risk_correct, semantic_high_risk_wrong = 0, 0, 0
+    semantic_high_risk_ids: list[int] = []
 
     for i, r in enumerate(records):
         counts[r["status"]] = counts.get(r["status"], 0) + 1
@@ -1044,6 +1616,14 @@ def aggregate(records: list[dict], tol: float) -> dict:
                 suspicious_correct += 1
             else:
                 suspicious_wrong += 1
+
+        if r.get("semantic_high_risk"):
+            semantic_high_risk += 1
+            semantic_high_risk_ids.append(i)
+            if is_ok_correct:
+                semantic_high_risk_correct += 1
+            else:
+                semantic_high_risk_wrong += 1
 
     return {
         "total": n,
@@ -1067,6 +1647,11 @@ def aggregate(records: list[dict], tol: float) -> dict:
         "suspicious_correct": suspicious_correct,
         "suspicious_wrong": suspicious_wrong,
         "suspicious_ids": suspicious_ids,
+        "semantic_high_risk": semantic_high_risk,
+        "semantic_high_risk_rate": semantic_high_risk / max(n, 1),
+        "semantic_high_risk_correct": semantic_high_risk_correct,
+        "semantic_high_risk_wrong": semantic_high_risk_wrong,
+        "semantic_high_risk_ids": semantic_high_risk_ids,
     }
 
 def print_report(s: dict) -> None:
@@ -1088,6 +1673,9 @@ def print_report(s: dict) -> None:
     print(f"Suspicious     : {s.get('suspicious', 0)}/{n} = {s.get('suspicious_rate', 0.0):.2%}")
     print(f"  suspicious_correct : {s.get('suspicious_correct', 0)}")
     print(f"  suspicious_wrong   : {s.get('suspicious_wrong', 0)}")
+    print(f"Semantic high-risk : {s.get('semantic_high_risk', 0)}/{n} = {s.get('semantic_high_risk_rate', 0.0):.2%}")
+    print(f"  semantic_high_risk_correct : {s.get('semantic_high_risk_correct', 0)}")
+    print(f"  semantic_high_risk_wrong   : {s.get('semantic_high_risk_wrong', 0)}")
     print(f"Verifier-fixed : {s['revised']}")
     print("=" * 60)
 
@@ -1139,6 +1727,7 @@ def main() -> int:
         os.makedirs(pdir, exist_ok=True)
         meta_path = os.path.join(pdir, "meta.json")
         ir_path = os.path.join(pdir, "ir.json")
+        ast_path = os.path.join(pdir, "ast.json")
         code_path = os.path.join(pdir, "compiled_gurobi.py")
 
         if os.path.exists(meta_path) and not args.overwrite:
@@ -1152,6 +1741,7 @@ def main() -> int:
                 enable_verifier=args.enable_verifier,
                 code_path=code_path,
                 ir_path=ir_path,
+                ast_path=ast_path,
                 backend=args.backend,
                 api_url=args.api_url,
                 api_key=args.api_key,
@@ -1165,7 +1755,7 @@ def main() -> int:
         records.append(rec)
 
     summary = aggregate(records, tol=args.tolerance)
-    summary["workflow"] = "cafa++-pass1-lite-expression-compiler"
+    summary["workflow"] = "cafa++-pass2-evidence-bound-ast-accounting"
     summary["model"] = args.model
     summary["backend"] = args.backend
     summary["verifier_enabled"] = args.enable_verifier

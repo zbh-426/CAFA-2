@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -844,6 +845,620 @@ def attach_suspicious_info(rec: dict, reasons: list[str]) -> None:
 # CAFA-SUSPICIOUS-CHECKS END
 
 
+
+
+# --------------------------------------------------------------------------- #
+# CAFA++ compiler AST layer
+# --------------------------------------------------------------------------- #
+
+# CAFA-AST-COMPILER-CHANGE START
+# This section adapts a classical compiler architecture to CAFA++ while keeping
+# the original single-file, easy-to-debug style:
+#
+#   CAFA-IR-lite JSON       -- produced by the small LLM frontend
+#       -> ModelAST         -- compiler AST with source/diagnostics attached
+#       -> semantic passes  -- symbol/type/polarity/ratio/coverage checks
+#       -> LinearIR         -- canonical coefficient form
+#       -> Gurobi backend   -- deterministic code generation
+#
+# The small LLM is not used as a verifier here. It only emits source-like HIR.
+# All checks below are deterministic compiler passes.
+
+
+@dataclass
+class Diagnostic:
+    """Compiler-style diagnostic, similar to warnings/errors in normal compilers."""
+
+    level: str                  # "ERROR", "WARNING", or "NOTE"
+    code: str                   # e.g., DOMAIN001, POLARITY001, NUM001
+    message: str
+    node_id: Optional[str] = None
+    source: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "level": self.level,
+            "code": self.code,
+            "message": self.message,
+            "node_id": self.node_id,
+            "source": self.source,
+        }
+
+
+@dataclass
+class ExprAST:
+    """Base class for CAFA expression AST nodes."""
+
+
+@dataclass
+class ConstAST(ExprAST):
+    value: float
+
+
+@dataclass
+class VarAST(ExprAST):
+    symbol: str
+
+
+@dataclass
+class AddAST(ExprAST):
+    terms: list[ExprAST]
+
+
+@dataclass
+class MulAST(ExprAST):
+    coef: float
+    expr: ExprAST
+
+
+@dataclass
+class VarDeclAST:
+    symbol: str
+    name: str
+    domain: str
+    inferred_domain: Optional[str] = None
+    semantic_type: Optional[str] = None
+    unit: Optional[str] = None
+    rationale: str = ""
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ObjectiveAST:
+    sense: str
+    expr: ExprAST
+
+
+@dataclass
+class ConstraintAST:
+    name: str
+    lhs: ExprAST
+    sense: str
+    rhs: ExprAST
+    source: str = ""
+
+
+@dataclass
+class ModelAST:
+    variables: list[VarDeclAST]
+    objective: ObjectiveAST
+    constraints: list[ConstraintAST]
+    code_hint: str = ""
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+
+
+@dataclass
+class SourceFacts:
+    """Deterministic lexical facts extracted from the NL source text."""
+
+    numbers: list[float]
+    has_maximize_hint: bool
+    has_minimize_hint: bool
+    upper_bound_cues: int
+    lower_bound_cues: int
+    equality_cues: int
+    ratio_like: bool
+    has_discrete_cue: bool
+
+
+@dataclass
+class LinearConstraintIR:
+    name: str
+    coeffs: dict[str, float]
+    sense: str
+    rhs: float
+    source: str = ""
+
+
+@dataclass
+class LinearModelIR:
+    variables: list[dict]
+    sense: str
+    objective_coeffs: dict[str, float]
+    objective_const: float
+    constraints: list[LinearConstraintIR]
+    diagnostics: list[Diagnostic] = field(default_factory=list)
+
+
+def _expr_to_source(expr: ExprAST) -> str:
+    """Pretty-printer used only for compiler traces and diagnostics."""
+    if isinstance(expr, ConstAST):
+        return f"{expr.value:g}"
+    if isinstance(expr, VarAST):
+        return expr.symbol
+    if isinstance(expr, MulAST):
+        inner = _expr_to_source(expr.expr)
+        if expr.coef == 1:
+            return inner
+        if expr.coef == -1:
+            return f"(-{inner})"
+        return f"({expr.coef:g}*{inner})"
+    if isinstance(expr, AddAST):
+        return " + ".join(_expr_to_source(t) for t in expr.terms) or "0"
+    return "<expr>"
+
+
+def ast_to_debug_dict(model: ModelAST) -> dict:
+    """Serialize the AST into a small JSON-debuggable form."""
+    return {
+        "variables": [v.__dict__ for v in model.variables],
+        "objective": {
+            "sense": model.objective.sense,
+            "expr": _expr_to_source(model.objective.expr),
+        },
+        "constraints": [
+            {
+                "name": c.name,
+                "lhs": _expr_to_source(c.lhs),
+                "sense": c.sense,
+                "rhs": _expr_to_source(c.rhs),
+                "source": c.source,
+            }
+            for c in model.constraints
+        ],
+        "diagnostics": [d.to_dict() for d in model.diagnostics],
+    }
+
+
+def linear_ir_to_debug_dict(lir: LinearModelIR) -> dict:
+    """Serialize canonical LinearIR for compiler_trace.json."""
+    return {
+        "variables": lir.variables,
+        "sense": lir.sense,
+        "objective_coeffs": lir.objective_coeffs,
+        "objective_const": lir.objective_const,
+        "constraints": [c.__dict__ for c in lir.constraints],
+        "diagnostics": [d.to_dict() for d in lir.diagnostics],
+    }
+
+
+def build_source_facts(description: str) -> SourceFacts:
+    """Lexer-like pass over the natural-language source text.
+
+    It extracts only cheap, deterministic facts. These facts are intentionally
+    approximate; later passes use them to emit diagnostics, not to overwrite the
+    model automatically.
+    """
+    desc_l = str(description).lower()
+    return SourceFacts(
+        numbers=extract_numbers(description),
+        has_maximize_hint=_contains_any(desc_l, MAXIMIZE_HINTS),
+        has_minimize_hint=_contains_any(desc_l, MINIMIZE_HINTS),
+        upper_bound_cues=_count_phrases(desc_l, UPPER_BOUND_PHRASES),
+        lower_bound_cues=_count_phrases(desc_l, LOWER_BOUND_PHRASES),
+        equality_cues=_count_phrases(desc_l, EQUALITY_PHRASES),
+        ratio_like=(
+            "twice" in desc_l
+            or "ratio" in desc_l
+            or "proportion" in desc_l
+            or "%" in desc_l
+            or re.search(r"\b\d+(?:\.\d+)?\s*times\b", desc_l) is not None
+        ),
+        has_discrete_cue=_contains_any(desc_l, DISCRETE_NOUNS) or "how many" in desc_l,
+    )
+
+
+def lower_python_expr_to_cafa_ast(node: ast.AST, var_ids: set[str]) -> ExprAST:
+    """Lower Python's expression AST into CAFA's smaller, linear-only AST.
+
+    This keeps Python syntax as a parsing frontend only. The rest of CAFA++ sees
+    our controlled ExprAST nodes, not arbitrary Python AST.
+    """
+    if isinstance(node, ast.Expression):
+        return lower_python_expr_to_cafa_ast(node.body, var_ids)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+            return ConstAST(float(node.value))
+        raise LinearParseError(f"unsupported constant: {node.value!r}")
+    if isinstance(node, ast.Num):  # pragma: no cover, for older Python compatibility
+        return ConstAST(float(node.n))
+    if isinstance(node, ast.Name):
+        if node.id not in var_ids:
+            raise LinearParseError(f"unknown variable: {node.id}")
+        return VarAST(node.id)
+    if isinstance(node, ast.UnaryOp):
+        inner = lower_python_expr_to_cafa_ast(node.operand, var_ids)
+        if isinstance(node.op, ast.UAdd):
+            return inner
+        if isinstance(node.op, ast.USub):
+            return MulAST(-1.0, inner)
+        raise LinearParseError("unsupported unary operator")
+    if isinstance(node, ast.BinOp):
+        left = lower_python_expr_to_cafa_ast(node.left, var_ids)
+        right = lower_python_expr_to_cafa_ast(node.right, var_ids)
+        if isinstance(node.op, ast.Add):
+            return AddAST([left, right])
+        if isinstance(node.op, ast.Sub):
+            return AddAST([left, MulAST(-1.0, right)])
+        if isinstance(node.op, ast.Mult):
+            if isinstance(left, ConstAST):
+                return MulAST(left.value, right)
+            if isinstance(right, ConstAST):
+                return MulAST(right.value, left)
+            raise LinearParseError("nonlinear multiplication is not allowed")
+        if isinstance(node.op, ast.Div):
+            if not isinstance(right, ConstAST) or abs(right.value) < 1e-12:
+                raise LinearParseError("division must be by a nonzero constant")
+            return MulAST(1.0 / right.value, left)
+        raise LinearParseError("unsupported binary operator")
+    raise LinearParseError(f"unsupported expression element: {type(node).__name__}")
+
+
+def parse_expr_to_ast(expr: str, var_ids: set[str]) -> ExprAST:
+    """Parse a normalized algebra string into CAFA ExprAST."""
+    expr = normalize_expr(expr)
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        raise LinearParseError(f"bad expression syntax: {expr}") from e
+    return lower_python_expr_to_cafa_ast(tree, var_ids)
+
+
+def build_model_ast(ir: dict) -> ModelAST:
+    """Build ModelAST from normalized IR-lite.
+
+    This is the compiler parser/binder boundary: the LLM JSON becomes a real AST
+    with bound variable symbols and parsed expression nodes.
+    """
+    variables = [
+        VarDeclAST(
+            symbol=str(v["id"]),
+            name=str(v.get("name", v["id"])),
+            domain=str(v.get("vtype", "CONTINUOUS")),
+            rationale=str(v.get("rationale", "")),
+            evidence=[str(v.get("name", "")), str(v.get("rationale", ""))],
+        )
+        for v in ir.get("variables", [])
+    ]
+    var_ids = {v.symbol for v in variables}
+    objective = ObjectiveAST(
+        sense=str(ir.get("sense", "MAXIMIZE")),
+        expr=parse_expr_to_ast(str(ir.get("objective", "0")), var_ids),
+    )
+
+    constraints: list[ConstraintAST] = []
+    for idx, c in enumerate(ir.get("constraints", [])):
+        lhs, sense, rhs = split_constraint(str(c.get("expression", "")))
+        constraints.append(
+            ConstraintAST(
+                name=safe_constr_name(str(c.get("name", f"c{idx+1}")), idx),
+                lhs=parse_expr_to_ast(lhs, var_ids),
+                sense=sense,
+                rhs=parse_expr_to_ast(rhs, var_ids),
+                source=str(c.get("source", "")),
+            )
+        )
+
+    return ModelAST(
+        variables=variables,
+        objective=objective,
+        constraints=constraints,
+        code_hint=str(ir.get("code_hint", "")),
+    )
+
+
+def _infer_domain_from_text(text: str, facts: SourceFacts) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Infer modeling domain/type/unit from deterministic lexical evidence."""
+    text_l = text.lower()
+    for noun in DISCRETE_NOUNS:
+        if noun in text_l:
+            return "INTEGER", "count", noun
+    for noun in CONTINUOUS_NOUNS:
+        if noun in text_l:
+            return "CONTINUOUS", "divisible_amount", noun
+    if facts.has_discrete_cue and not _contains_any(text_l, CONTINUOUS_NOUNS):
+        return "INTEGER", "count", None
+    return None, None, None
+
+
+def pass_infer_variable_domains(model: ModelAST, facts: SourceFacts) -> None:
+    """Type-checking pass: infer expected variable domains from symbol evidence."""
+    for var in model.variables:
+        evidence_text = " ".join([var.name, var.rationale] + var.evidence)
+        inferred, semantic_type, unit = _infer_domain_from_text(evidence_text, facts)
+        var.inferred_domain = inferred
+        var.semantic_type = semantic_type
+        var.unit = unit
+        if inferred and inferred != var.domain:
+            level = "WARNING"
+            model.diagnostics.append(
+                Diagnostic(
+                    level=level,
+                    code="DOMAIN001",
+                    message=f"Variable {var.symbol} looks {inferred} from text evidence but is declared {var.domain}.",
+                    node_id=f"var:{var.symbol}",
+                    source=evidence_text.strip(),
+                )
+            )
+
+
+def pass_objective_sense(model: ModelAST, facts: SourceFacts) -> None:
+    """Semantic pass: compare text-level maximize/minimize cues against objective sense."""
+    if model.objective.sense == "MAXIMIZE" and facts.has_minimize_hint and not facts.has_maximize_hint:
+        model.diagnostics.append(Diagnostic(
+            level="WARNING",
+            code="OBJ001",
+            message="Problem text suggests minimization but model sense is MAXIMIZE.",
+        ))
+    if model.objective.sense == "MINIMIZE" and facts.has_maximize_hint and not facts.has_minimize_hint:
+        model.diagnostics.append(Diagnostic(
+            level="WARNING",
+            code="OBJ002",
+            message="Problem text suggests maximization but model sense is MINIMIZE.",
+        ))
+
+
+def pass_constraint_polarity(model: ModelAST) -> None:
+    """Semantic pass: check source phrase polarity against each constraint sense."""
+    for idx, c in enumerate(model.constraints):
+        src_l = c.source.lower()
+        if _contains_any(src_l, UPPER_BOUND_PHRASES) and c.sense not in {"<=", "=="}:
+            model.diagnostics.append(Diagnostic(
+                level="WARNING",
+                code="POLARITY001",
+                message=f"Source suggests <= but constraint uses {c.sense}.",
+                node_id=f"constraint:{idx}",
+                source=c.source,
+            ))
+        if _contains_any(src_l, LOWER_BOUND_PHRASES) and c.sense not in {">=", "=="}:
+            model.diagnostics.append(Diagnostic(
+                level="WARNING",
+                code="POLARITY002",
+                message=f"Source suggests >= but constraint uses {c.sense}.",
+                node_id=f"constraint:{idx}",
+                source=c.source,
+            ))
+        if _contains_any(src_l, EQUALITY_PHRASES) and c.sense != "==":
+            model.diagnostics.append(Diagnostic(
+                level="WARNING",
+                code="POLARITY003",
+                message=f"Source suggests equality but constraint uses {c.sense}.",
+                node_id=f"constraint:{idx}",
+                source=c.source,
+            ))
+
+
+def linearize_expr_ast(expr: ExprAST) -> Linear:
+    """Lower ExprAST to coefficient map + constant. This is the AST -> LinearIR step."""
+    if isinstance(expr, ConstAST):
+        return {}, float(expr.value)
+    if isinstance(expr, VarAST):
+        return {expr.symbol: 1.0}, 0.0
+    if isinstance(expr, MulAST):
+        coeffs, const = linearize_expr_ast(expr.expr)
+        return _scale((coeffs, const), expr.coef)
+    if isinstance(expr, AddAST):
+        out: Linear = ({}, 0.0)
+        for term in expr.terms:
+            out = _merge(out, linearize_expr_ast(term))
+        return out
+    raise LinearParseError(f"cannot linearize AST node: {type(expr).__name__}")
+
+
+def pass_ratio_constraint(model: ModelAST, facts: SourceFacts) -> None:
+    """Semantic pass: ratio wording should usually produce a multi-variable constraint."""
+    if not facts.ratio_like:
+        return
+    linked = False
+    for c in model.constraints:
+        lhs_coeffs, _lhs_const = linearize_expr_ast(c.lhs)
+        rhs_coeffs, _rhs_const = linearize_expr_ast(c.rhs)
+        involved = set(lhs_coeffs) | set(rhs_coeffs)
+        if len(involved) >= 2:
+            linked = True
+            break
+    if not linked:
+        model.diagnostics.append(Diagnostic(
+            level="WARNING",
+            code="RATIO001",
+            message="Ratio/proportion wording detected but no constraint links two variables.",
+        ))
+
+
+def pass_constraint_count(model: ModelAST, facts: SourceFacts) -> None:
+    """Semantic pass: coarse cue count versus emitted constraint count."""
+    cue_count = facts.upper_bound_cues + facts.lower_bound_cues + facts.equality_cues
+    if cue_count >= 3 and len(model.constraints) < max(2, cue_count - 1):
+        model.diagnostics.append(Diagnostic(
+            level="NOTE",
+            code="COUNT001",
+            message=f"Found {cue_count} bound/equality cues but only {len(model.constraints)} constraints.",
+        ))
+
+
+def pass_number_coverage(model: ModelAST, facts: SourceFacts) -> None:
+    """Semantic pass: compare source numbers with AST numbers after parsing."""
+    expr_texts = [_expr_to_source(model.objective.expr)]
+    for c in model.constraints:
+        expr_texts.append(_expr_to_source(c.lhs))
+        expr_texts.append(_expr_to_source(c.rhs))
+    ir_nums = extract_numbers(" ".join(expr_texts))
+    if not facts.numbers:
+        return
+    missing = [n for n in facts.numbers if not any(_num_close(n, m, rel=1e-7, abs_tol=1e-7) for m in ir_nums)]
+    important_missing = [n for n in missing if abs(n) > 3]
+    coverage = 1.0 - (len(missing) / max(len(facts.numbers), 1))
+    if coverage < 0.60:
+        model.diagnostics.append(Diagnostic(
+            level="WARNING",
+            code="NUM001",
+            message=f"Low number coverage: {coverage:.0%}; missing examples: {important_missing[:6] or missing[:6]}.",
+        ))
+    elif important_missing:
+        model.diagnostics.append(Diagnostic(
+            level="NOTE",
+            code="NUM002",
+            message=f"Some source numbers are not present in the model: {important_missing[:6]}.",
+        ))
+
+
+def run_semantic_passes(model: ModelAST, facts: SourceFacts) -> ModelAST:
+    """Run compiler-style semantic passes over ModelAST."""
+    pass_infer_variable_domains(model, facts)
+    pass_objective_sense(model, facts)
+    pass_constraint_polarity(model)
+    pass_ratio_constraint(model, facts)
+    pass_constraint_count(model, facts)
+    pass_number_coverage(model, facts)
+    return model
+
+
+def lower_ast_to_linear_ir(model: ModelAST) -> LinearModelIR:
+    """Lower checked ModelAST into canonical coefficient-level LinearIR."""
+    obj_coeffs, obj_const = linearize_expr_ast(model.objective.expr)
+    constraints: list[LinearConstraintIR] = []
+    for c in model.constraints:
+        lhs_coeffs, lhs_const = linearize_expr_ast(c.lhs)
+        rhs_coeffs, rhs_const = linearize_expr_ast(c.rhs)
+        coeffs, const = _merge((lhs_coeffs, lhs_const), (rhs_coeffs, rhs_const), scale_b=-1.0)
+        constraints.append(LinearConstraintIR(
+            name=c.name,
+            coeffs=coeffs,
+            sense=c.sense,
+            rhs=-const,
+            source=c.source,
+        ))
+    return LinearModelIR(
+        variables=[
+            {
+                "id": v.symbol,
+                "name": v.name,
+                "vtype": v.domain,
+                "inferred_domain": v.inferred_domain,
+                "semantic_type": v.semantic_type,
+                "unit": v.unit,
+            }
+            for v in model.variables
+        ],
+        sense=model.objective.sense,
+        objective_coeffs=obj_coeffs,
+        objective_const=obj_const,
+        constraints=constraints,
+        diagnostics=list(model.diagnostics),
+    )
+
+
+def compile_linear_ir_to_gurobi(lir: LinearModelIR, save_path: Optional[str] = None) -> str:
+    """Backend: deterministic LinearIR -> runnable Gurobi Python."""
+    var_ids = [v["id"] for v in lir.variables]
+    var_map = {vid: safe_py_name(vid) for vid in var_ids}
+
+    lines: list[str] = []
+    lines.append("import gurobipy as gp")
+    lines.append('env = gp.Env(empty=True); env.setParam("OutputFlag", 0); env.start()')
+    lines.append("m = gp.Model(env=env)")
+    lines.append("")
+
+    for v in lir.variables:
+        pyv = var_map[v["id"]]
+        name = py_quote(v["name"])
+        vtype = v["vtype"]
+        if vtype == "CONTINUOUS":
+            lines.append(f"{pyv} = m.addVar(name={name}, lb=0.0, vtype=gp.GRB.CONTINUOUS)")
+        elif vtype == "INTEGER":
+            lines.append(f"{pyv} = m.addVar(name={name}, lb=0.0, vtype=gp.GRB.INTEGER)")
+        elif vtype == "BINARY":
+            lines.append(f"{pyv} = m.addVar(name={name}, vtype=gp.GRB.BINARY)")
+        else:
+            raise IRValidationError(f"unsupported vtype: {vtype}")
+
+    lines.append("")
+    obj_expr = linear_to_gurobi(lir.objective_coeffs, lir.objective_const, var_map)
+    grb_sense = "gp.GRB.MAXIMIZE" if lir.sense == "MAXIMIZE" else "gp.GRB.MINIMIZE"
+    lines.append(f"m.setObjective({obj_expr}, {grb_sense})")
+    for c in lir.constraints:
+        lhs_expr = linear_to_gurobi(c.coeffs, 0.0, var_map)
+        lines.append(f"m.addConstr({lhs_expr} {c.sense} {c.rhs:.15g}, name={py_quote(c.name)})")
+    lines.append("")
+    lines.append("m.optimize()")
+    code = "\n".join(lines) + "\n"
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(code)
+    return code
+
+
+def compile_ir_to_gurobi(
+    ir: dict,
+    save_path: Optional[str] = None,
+    description: str = "",
+    diagnostics_out: Optional[list[dict]] = None,
+    trace_path: Optional[str] = None,
+) -> str:
+    """Compiler driver: IR-lite -> ModelAST -> semantic passes -> LinearIR -> Gurobi.
+
+    The function name is preserved so the rest of the original workflow remains
+    easy to diff and debug. Compared with the old version, this driver now builds
+    explicit AST/MIR objects and exposes diagnostics through `diagnostics_out`.
+    """
+    facts = build_source_facts(description)
+    model_ast = build_model_ast(ir)
+    model_ast = run_semantic_passes(model_ast, facts)
+    linear_ir = lower_ast_to_linear_ir(model_ast)
+
+    if diagnostics_out is not None:
+        diagnostics_out.extend([d.to_dict() for d in model_ast.diagnostics])
+
+    if trace_path:
+        os.makedirs(os.path.dirname(trace_path), exist_ok=True)
+        with open(trace_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "source_facts": facts.__dict__,
+                    "model_ast": ast_to_debug_dict(model_ast),
+                    "linear_ir": linear_ir_to_debug_dict(linear_ir),
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    return compile_linear_ir_to_gurobi(linear_ir, save_path=save_path)
+
+
+def attach_compiler_diagnostics(rec: dict, diagnostics: list[dict]) -> None:
+    """Merge AST compiler diagnostics into existing suspicious metadata.
+
+    ERROR/WARNING diagnostics become hard_suspicious. NOTE diagnostics remain
+    soft_suspicious. This keeps the old suspicious_reasons field while adding a
+    more compiler-like diagnostics list for future passes.
+    """
+    rec["diagnostics"] = diagnostics
+    hard = [d for d in diagnostics if d.get("level") in {"ERROR", "WARNING"}]
+    soft = [d for d in diagnostics if d.get("level") == "NOTE"]
+    rec["hard_suspicious"] = bool(hard)
+    rec["soft_suspicious"] = bool(soft or rec.get("suspicious"))
+    existing = list(rec.get("suspicious_reasons", []))
+    for d in diagnostics:
+        reason = f"{d.get('level')}:{d.get('code')}: {d.get('message')}"
+        if reason not in existing:
+            existing.append(reason)
+    attach_suspicious_info(rec, existing)
+
+# CAFA-AST-COMPILER-CHANGE END
+
 # --------------------------------------------------------------------------- #
 # Verifier (kept as later-work hook; disabled by default)
 # --------------------------------------------------------------------------- #
@@ -899,6 +1514,7 @@ def solve(
     enable_verifier: bool,
     code_path: Optional[str],
     ir_path: Optional[str] = None,
+    trace_path: Optional[str] = None,
     backend: str = "lmstudio",
     api_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -922,6 +1538,11 @@ def solve(
         "suspicious": False,
         "suspicious_score": 0,
         "suspicious_reasons": [],
+        # CAFA-AST-COMPILER-CHANGE: compiler-style diagnostics and trace are
+        # produced by the AST/MIR passes, not by extra LLM prompting.
+        "diagnostics": [],
+        "hard_suspicious": False,
+        "soft_suspicious": False,
     }
 
     # 1. primary LM Studio call
@@ -959,7 +1580,16 @@ def solve(
 
     # 3. deterministic IR-lite -> Gurobi compiler
     try:
-        code = compile_ir_to_gurobi(ir, save_path=code_path)
+        compiler_diagnostics: list[dict] = []
+        code = compile_ir_to_gurobi(
+            ir,
+            save_path=code_path,
+            description=description,
+            diagnostics_out=compiler_diagnostics,
+            trace_path=trace_path,
+        )
+        rec["diagnostics"] = compiler_diagnostics
+        attach_compiler_diagnostics(rec, compiler_diagnostics)
     except Exception as e:
         rec["status"], rec["error"] = "compile_fail", str(e)
         extra = [f"compiler_status_suspicious:compile_fail: {e}"]
@@ -972,6 +1602,9 @@ def solve(
     res = execute_code(code, save_path=code_path)
     rec.update(status=res["status"], obj_val=res["obj_val"], error=res["error"])
     attach_suspicious_info(rec, analyze_suspicious_case(description, ir, result=res))
+    # CAFA-AST-COMPILER-CHANGE: merge compiler diagnostics after the legacy
+    # suspicious checker so WARNING/ERROR diagnostics are not overwritten.
+    attach_compiler_diagnostics(rec, compiler_diagnostics)
 
     # 5. optional verifier, kept for future use and disabled by default
     if enable_verifier and needs_verification(res):
@@ -982,7 +1615,14 @@ def solve(
         )
         if revised:
             try:
-                revised_code = compile_ir_to_gurobi(revised, save_path=code_path)
+                revised_diagnostics: list[dict] = []
+                revised_code = compile_ir_to_gurobi(
+                    revised,
+                    save_path=code_path,
+                    description=description,
+                    diagnostics_out=revised_diagnostics,
+                    trace_path=trace_path,
+                )
                 res2 = execute_code(revised_code, save_path=code_path)
             except Exception:
                 revised_code, res2 = None, {"status": "compile_fail", "obj_val": None, "error": "revised compile failed"}
@@ -994,8 +1634,10 @@ def solve(
                 rec["ir"] = rec["formulation"] = revised
                 rec["code_hint"] = revised.get("code_hint")
                 rec["code_used"] = revised_code
+                rec["diagnostics"] = revised_diagnostics
                 rec.update(status=res2["status"], obj_val=res2["obj_val"], error=res2["error"])
                 attach_suspicious_info(rec, analyze_suspicious_case(description, revised, result=res2))
+                attach_compiler_diagnostics(rec, revised_diagnostics)
                 rec["revised"] = True
     return rec
 
@@ -1140,6 +1782,7 @@ def main() -> int:
         meta_path = os.path.join(pdir, "meta.json")
         ir_path = os.path.join(pdir, "ir.json")
         code_path = os.path.join(pdir, "compiled_gurobi.py")
+        trace_path = os.path.join(pdir, "compiler_trace.json")
 
         if os.path.exists(meta_path) and not args.overwrite:
             with open(meta_path, encoding="utf-8") as f:
@@ -1152,6 +1795,7 @@ def main() -> int:
                 enable_verifier=args.enable_verifier,
                 code_path=code_path,
                 ir_path=ir_path,
+                trace_path=trace_path,
                 backend=args.backend,
                 api_url=args.api_url,
                 api_key=args.api_key,
