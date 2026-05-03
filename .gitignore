@@ -21,4 +21,5 @@ venv/
 *.swo
 /outputs
 /outputs_ir
+/outputs_ir
 /outputs_ir_lite
