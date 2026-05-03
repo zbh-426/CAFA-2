@@ -511,7 +511,7 @@ def print_report(s: dict) -> None:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset",     required=True)
-    p.add_argument("--model",       default="qwen3-4b-instruct-2507")
+    p.add_argument("--model",       default="qwen3.5-2b")
     p.add_argument("--output_dir",  default="outputs")
     p.add_argument("--no_verifier", dest="enable_verifier", action="store_false", default=False)
     p.add_argument("--tolerance",   type=float, default=1e-4)
