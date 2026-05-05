@@ -369,6 +369,8 @@ def call_llm(
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(**payload)
+            if resp.choices[0].message.reasoning_content:
+                return resp.choices[0].message.reasoning_content or ""
             return resp.choices[0].message.content or ""
         except Exception as e:
             last_error = e
@@ -2327,7 +2329,7 @@ def safe_path_name(name: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
-    p.add_argument("--model", default="qwen3.5-0.8b")
+    p.add_argument("--model", default="qwen3.5-4b")
     p.add_argument("--output_dir", default="outputs_ir_lite")
     p.add_argument("--enable_verifier", action="store_true", default=True)
     p.add_argument("--no_verifier", dest="enable_verifier", action="store_false")  # legacy flag
