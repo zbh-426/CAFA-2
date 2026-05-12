@@ -1,5 +1,5 @@
 """
-CAFA++ compiler-like pass1 - compact LM Studio auto-formulation with an AST-centered compiler.
+CAFA++ compiler-like pass1 - organized AST-centered auto-formulation pipeline.
 
 Pipeline:
   description
@@ -21,7 +21,7 @@ Design choice:
 
 Usage:
   python cafa_compiler.py --dataset bench.jsonl --model qwen3-4b-instruct-2507 \
-      --output_dir results_compiler_like --backend lmstudio --json_mode json_schema --overwrite
+      --output_dir results_compiler_clean --backend lmstudio --json_mode json_schema --overwrite
 """
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ from typing import Any, Optional
 # Prompts
 # --------------------------------------------------------------------------- #
 
-# CAFA-IR-LITE-CHANGE START
 # Keep the old CAFA schema/prompt shape because Qwen3-4B is already good at it.
 # The only architectural change is downstream: code is NOT executed; expressions are compiled.
 
@@ -211,7 +210,6 @@ FEW_SHOT = [
         },
     },
 ]
-# CAFA-IR-LITE-CHANGE END
 
 
 def build_messages(description: str) -> list[dict]:
@@ -227,7 +225,6 @@ def build_messages(description: str) -> list[dict]:
 # LLM call
 # --------------------------------------------------------------------------- #
 
-# CAFA-LMSTUDIO-CHANGE START
 # LM Studio exposes an OpenAI-compatible /v1/chat/completions endpoint.
 # Keep the code plain: no client class, only small helpers used by call_llm().
 
@@ -372,14 +369,14 @@ def call_llm(
     for attempt in range(1, max_retries + 1):
         try:
             resp = client.chat.completions.create(**payload)
+            if resp.choices[0].message.reasoning_content:
+                return resp.choices[0].message.reasoning_content or ""
             return resp.choices[0].message.content or ""
         except Exception as e:
             last_error = e
             if attempt == max_retries:
                 break
     raise RuntimeError(f"LLM request failed after {max_retries} attempt(s): {last_error}")
-
-# CAFA-LMSTUDIO-CHANGE END
 
 
 # --------------------------------------------------------------------------- #
@@ -463,7 +460,6 @@ def parse_formulation(raw: str) -> Optional[dict]:
         return parse_surface_formulation(raw)
     except Exception:
         return None
-
 
 
 def _clean_evidence_id(eid: Any, fallback: str) -> str:
@@ -783,9 +779,6 @@ def parse_constraint_expr(expr: str, var_ids: set[str]) -> tuple[dict[str, float
 # --------------------------------------------------------------------------- #
 # CAFA-AST builder
 # --------------------------------------------------------------------------- #
-
-# CAFA-AST-CHANGE START
-# CAFA-COMPILER-LIKE-CHANGE:
 # The model-facing object keeps expression strings for small-model robustness.
 # This AST is now the canonical compiler/checker-facing representation: expressions
 # are parsed once into variables, terms, constants, senses, and evidence links.
@@ -865,15 +858,11 @@ def build_cafa_ast(ir: dict) -> dict:
         "constraints": constraints_ast,
     }
 
-# CAFA-AST-CHANGE END
-
-
 
 # --------------------------------------------------------------------------- #
 # AST -> Linear-IR lowering + Linear-IR -> Gurobi backend
 # --------------------------------------------------------------------------- #
 
-# CAFA-COMPILER-LIKE-CHANGE START
 # This is the main architectural correction compared with the previous version:
 #   surface JSON -> CAFA-AST -> CAFA-Linear-IR -> Gurobi code
 # The old compile_ir_to_gurobi() name is kept as a compatibility wrapper, but the
@@ -1019,30 +1008,13 @@ def compile_ast_to_gurobi(ast_model: dict, save_path: Optional[str] = None) -> s
     """Convenience compiler entry: CAFA-AST -> CAFA-Linear-IR -> Gurobi."""
     return compile_linear_ir_to_gurobi(lower_ast_to_linear_ir(ast_model), save_path=save_path)
 
-# CAFA-COMPILER-LIKE-CHANGE END
-
-
 
 # --------------------------------------------------------------------------- #
 # Semantic binding middle-end + deterministic repair
 # --------------------------------------------------------------------------- #
 
-# CAFA-SEMANTIC-BINDING-PATCH START
-# Motivation:
-#   The previous semantic accounting pass checked whether numbers were supported
-#   by some evidence, but it did not always check whether a number was bound to
-#   the right entity/variable or whether a capacity belonged to one variable or
-#   a group of variables.  The following middle-end is deliberately lightweight:
-#   it keeps the existing IR/AST/compiler structure, but adds compiler-style
-#   symbol-table and relation-table heuristics plus deterministic repair passes.
-#
-# Repairs implemented here:
-#   1. variable-unit/vtype repair: pills/phones/laptops/cars/furnaces -> INTEGER
-#      unless the task clearly asks for continuous quantities such as hours.
-#   2. coefficient-to-variable binding repair for budget/cost constraints:
-#      e.g. phone cost=400, laptop cost=100, but IR says 100*x_phone+400*x_laptop.
-#   3. constraint-scope repair for duplicated single-variable bounds that should
-#      be one group-total bound: x1<=12, x2<=12 -> x1+x2<=12.
+# Lightweight deterministic guards before AST construction.
+# They repair only conservative, high-frequency semantic issues.
 
 GENERIC_VAR_NAMES = {"x", "y", "z", "w", "u", "v", "x1", "x2", "x3", "x4", "m1", "m2"}
 
@@ -1498,8 +1470,6 @@ def deterministic_semantic_repair(description: str, ir: dict) -> tuple[dict, lis
     patched["semantic_repair_notes"] = notes
     return patched, notes
 
-# CAFA-SEMANTIC-BINDING-PATCH END
-
 
 def safe_py_name(var_id: str) -> str:
     var_id = re.sub(r"\W+", "_", str(var_id)).strip("_") or "x"
@@ -1577,12 +1547,10 @@ def execute_code(code: str, save_path: Optional[str] = None) -> dict:
         return {"status": "exec_fail", "obj_val": None, "error": str(e)}
 
 
-
 # --------------------------------------------------------------------------- #
 # Deterministic suspicious-case checks
 # --------------------------------------------------------------------------- #
 
-# CAFA-SUSPICIOUS-CHECKS START
 # These checks do not change the answer. They only mark cases that are likely
 # to contain semantic formulation mistakes, so personal developers can inspect
 # the remaining wrong-but-runnable cases quickly.
@@ -1773,15 +1741,11 @@ def attach_suspicious_info(rec: dict, reasons: list[str]) -> None:
     rec["suspicious"] = bool(reasons)
     rec["suspicious_score"] = len(reasons)
 
-# CAFA-SUSPICIOUS-CHECKS END
-
-
 
 # --------------------------------------------------------------------------- #
 # Evidence-bound semantic accounting checks
 # --------------------------------------------------------------------------- #
 
-# CAFA-SEMANTIC-ACCOUNTING START
 # These checks are stricter than the broad suspicious flags.  They compare the
 # canonical AST against the evidence table and the original description.  They
 # still do not use ground truth.  Only HIGH-RISK accounting failures trigger the
@@ -1981,12 +1945,20 @@ def attach_semantic_accounting_info(rec: dict, reasons: list[str], high_risk: li
 
 
 def needs_semantic_verification(result: dict, rec: dict) -> bool:
-    """Verifier trigger: only solver failures or high-risk semantic accounting failures."""
+    """Verifier trigger: solver failures or high-risk semantic accounting failures.
+
+    CAFA-INFEASIBLE-CHANGE:
+    When the benchmark ground truth is null/None, an infeasible solver status is
+    the expected answer.  In that case, do not send the formulation to the
+    verifier, because the verifier may incorrectly try to "repair" a correct
+    infeasible model into a feasible one.
+    """
+    if rec.get("expected_infeasible") and result.get("status") == "infeasible":
+        return False
     if needs_verification(result):
         return True
     return bool(rec.get("semantic_high_risk"))
 
-# CAFA-SEMANTIC-ACCOUNTING END
 
 # --------------------------------------------------------------------------- #
 # Verifier (semantic high-risk gated)
@@ -2039,30 +2011,25 @@ def verify(
 # Per-problem solve
 # --------------------------------------------------------------------------- #
 
-def solve(
-    description: str,
-    ground_truth: float,
-    model: str,
-    enable_verifier: bool,
-    code_path: Optional[str],
-    ir_path: Optional[str] = None,
-    ast_path: Optional[str] = None,
-    backend: str = "lmstudio",
-    api_url: Optional[str] = None,
-    api_key: Optional[str] = None,
-    json_mode: str = "auto",
-    timeout: int = 120,
-    max_retries: int = 3,
-) -> dict:
-    """Run the full compiler-like pass1 pipeline for one problem. Returns a record dict."""
-    rec = {
+def make_record(description: str, ground_truth: Optional[float]) -> dict:
+    """Create the per-problem metadata record used by solve().
+
+    CAFA-INFEASIBLE-CHANGE:
+    A null/None benchmark answer means the correct mathematical model is
+    infeasible.  Keep this explicitly in the metadata so correctness counting
+    can compare solver status against the null target instead of trying to
+    cast null to float.
+    """
+    return {
         "description": description,
         "ground_truth": ground_truth,
+        "expected_infeasible": ground_truth is None,
+        "predicted_answer": None,
         "raw": "",
         "surface": None,
         "formulation": None,  # backward-compatible alias for surface
-        "ir": None,           # real lowered compiler IR, not the model-facing JSON
         "ast": None,
+        "ir": None,           # real lowered compiler IR
         "code_used": None,
         "code_hint": None,
         "obj_val": None,
@@ -2077,14 +2044,120 @@ def solve(
         "semantic_high_risk": False,
         "semantic_score": 0,
         "semantic_high_risk_score": 0,
-        # CAFA-SEMANTIC-BINDING-PATCH START
-        # Deterministic compiler middle-end repairs applied before AST lowering.
         "semantic_repaired": False,
         "semantic_repair_reasons": [],
-        # CAFA-SEMANTIC-BINDING-PATCH END
     }
 
-    # 1. primary LM Studio call
+
+def save_json(path: Optional[str], obj: Any) -> None:
+    """Save a JSON artifact when a path is provided."""
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def set_failure(rec: dict, status: str, error: Any) -> dict:
+    """Set failure fields and return the same record for early returns."""
+    rec["status"] = status
+    rec["error"] = str(error)
+    return rec
+
+
+def set_surface(rec: dict, surface: dict) -> None:
+    """Attach the model-facing surface formulation to the record."""
+    rec["surface"] = surface
+    rec["formulation"] = surface
+    rec["code_hint"] = surface.get("code_hint")
+
+
+def refresh_analysis(
+    rec: dict,
+    description: str,
+    surface: dict,
+    ast_model: Optional[dict],
+    result: Optional[dict] = None,
+) -> None:
+    """Update suspicious and semantic-accounting fields."""
+    attach_suspicious_info(rec, analyze_suspicious_case(description, surface, result=result))
+    sem_reasons, sem_high = semantic_accounting_checks(description, surface, ast_model, result=result)
+    attach_semantic_accounting_info(rec, sem_reasons, sem_high)
+
+
+def parse_and_repair_surface(description: str, raw: str) -> tuple[dict, list[str]]:
+    """Parse LLM output and apply optional deterministic semantic repair."""
+    surface = parse_surface_formulation(raw)
+    try:
+        return deterministic_semantic_repair(description, surface)
+    except Exception as e:
+        return surface, [f"deterministic_repair_failed:{e}"]
+
+
+def compile_surface_pipeline(
+    surface: dict,
+    code_path: Optional[str],
+    ir_path: Optional[str] = None,
+    ast_path: Optional[str] = None,
+) -> tuple[dict, dict, str, dict]:
+    """Run the deterministic compiler path: surface -> AST -> Linear-IR -> Gurobi -> execute."""
+    ast_model = build_cafa_ast(surface)
+    linear_ir = lower_ast_to_linear_ir(ast_model)
+    save_json(ir_path, linear_ir)
+    save_json(ast_path, ast_model)
+    code = compile_linear_ir_to_gurobi(linear_ir, save_path=code_path)
+    result = execute_code(code, save_path=code_path)
+    return ast_model, linear_ir, code, result
+
+
+def accept_solution(rec: dict, surface: dict, ast_model: dict, linear_ir: dict, code: str, result: dict) -> None:
+    """Write a compiled/executed solution into the record."""
+    set_surface(rec, surface)
+    rec["ast"] = ast_model
+    rec["ir"] = linear_ir
+    rec["code_used"] = code
+    rec["predicted_answer"] = result["obj_val"] if result.get("status") == "ok" else None
+    rec.update(status=result["status"], obj_val=result["obj_val"], error=result["error"])
+
+
+def result_is_better(candidate: dict, current: dict, ground_truth: Optional[float]) -> bool:
+    """Prefer a revised solution only when it improves the target match.
+
+    CAFA-INFEASIBLE-CHANGE:
+    For null/None ground truth, the target is the solver status `infeasible`,
+    not a numeric objective.  Therefore a revised candidate is better only if
+    it changes a non-infeasible result into an infeasible one.
+    """
+    if ground_truth is None:
+        return candidate.get("status") == "infeasible" and current.get("status") != "infeasible"
+
+    if candidate["status"] != "ok":
+        return False
+    if current["status"] != "ok":
+        return True
+    old_obj = current["obj_val"] if current["obj_val"] is not None else 0.0
+    return abs(candidate["obj_val"] - ground_truth) < abs(old_obj - ground_truth)
+
+
+def solve(
+    description: str,
+    ground_truth: Optional[float],
+    model: str,
+    enable_verifier: bool,
+    code_path: Optional[str],
+    ir_path: Optional[str] = None,
+    ast_path: Optional[str] = None,
+    backend: str = "lmstudio",
+    api_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    json_mode: str = "auto",
+    timeout: int = 120,
+    max_retries: int = 3,
+) -> dict:
+    """Run one NL4OPT-style problem through the compiler-like CAFA++ pipeline."""
+    rec = make_record(description, ground_truth)
+
+    # 1) LLM front-end: natural language -> surface JSON.
     try:
         rec["raw"] = call_llm(
             model=model,
@@ -2097,134 +2170,68 @@ def solve(
             max_retries=max_retries,
         )
     except Exception as e:
-        rec["status"], rec["error"] = "llm_fail", str(e)
+        return set_failure(rec, "llm_fail", e)
+
+    # 2) Parse and repair the surface formulation.
+    try:
+        surface, repair_notes = parse_and_repair_surface(description, rec["raw"])
+    except Exception as e:
+        return set_failure(rec, "parse_fail", e)
+
+    set_surface(rec, surface)
+    rec["semantic_repaired"] = bool(repair_notes)
+    rec["semantic_repair_reasons"] = repair_notes
+
+    # 3) Deterministic compiler backend: surface -> AST -> Linear-IR -> Gurobi.
+    try:
+        ast_model, linear_ir, code, result = compile_surface_pipeline(surface, code_path, ir_path, ast_path)
+    except Exception as e:
+        set_failure(rec, "compile_fail", e)
+        extra = [f"compiler_status_suspicious:compile_failed:{e}"]
+        attach_suspicious_info(rec, extra)
+        attach_semantic_accounting_info(rec, [f"semantic:compile_failed:{e}"], [f"semantic:compile_failed:{e}"])
         return rec
 
-    # 2. parse JSON -> normalized CAFA-Surface formulation.
-    # CAFA-COMPILER-LIKE-CHANGE: this is no longer treated as the real IR.
-    try:
-        surface = parse_surface_formulation(rec["raw"])
-    except Exception as e:
-        rec["status"], rec["error"] = "parse_fail", str(e)
+    accept_solution(rec, surface, ast_model, linear_ir, code, result)
+    refresh_analysis(rec, description, surface, ast_model, result=result)
+
+    # 4) Optional verifier for solver failures or high-risk semantic flags.
+    if not (enable_verifier and needs_semantic_verification(result, rec)):
         return rec
 
-    # CAFA-SEMANTIC-BINDING-PATCH START
-    # Run deterministic front-end semantic repairs on the surface formulation
-    # before AST construction.  The canonical compiler path remains:
-    # surface -> AST -> Linear-IR -> Gurobi.
-    try:
-        surface, semantic_repair_reasons = deterministic_semantic_repair(description, surface)
-        rec["semantic_repaired"] = bool(semantic_repair_reasons)
-        rec["semantic_repair_reasons"] = semantic_repair_reasons
-    except Exception as e:
-        # Repairs are optional guards.  If a repair pass fails, keep the original
-        # surface formulation so the previous behavior is preserved.
-        rec["semantic_repair_reasons"] = [f"deterministic_repair_failed:{e}"]
-    # CAFA-SEMANTIC-BINDING-PATCH END
-
-    rec["surface"] = surface
-    rec["formulation"] = surface  # backward-compatible key for old meta readers
-    rec["code_hint"] = surface.get("code_hint")
-
-    # 3. CAFA-AST build from the surface formulation.
-    # CAFA-COMPILER-LIKE-CHANGE: AST is the canonical compiler representation.
-    try:
-        ast_model = build_cafa_ast(surface)
-    except Exception as e:
-        rec["status"], rec["error"] = "compile_fail", f"AST build failed: {e}"
-        attach_suspicious_info(rec, [f"compiler_status_suspicious:ast_build_failed: {e}"])
-        attach_semantic_accounting_info(rec, [f"semantic:ast_build_failed:{e}"], [f"semantic:ast_build_failed:{e}"])
+    revised = verify(
+        description,
+        surface,
+        result,
+        model=model,
+        backend=backend,
+        api_url=api_url,
+        api_key=api_key,
+        json_mode=json_mode,
+        timeout=timeout,
+        max_retries=max_retries,
+        semantic_report={
+            "semantic_reasons": rec.get("semantic_reasons", []),
+            "semantic_high_risk_reasons": rec.get("semantic_high_risk_reasons", []),
+            "suspicious_reasons": rec.get("suspicious_reasons", []),
+            "semantic_repair_reasons": rec.get("semantic_repair_reasons", []),
+        },
+    )
+    if not revised:
         return rec
 
-    rec["ast"] = ast_model
-    attach_suspicious_info(rec, analyze_suspicious_case(description, surface))
-    sem_reasons, sem_high = semantic_accounting_checks(description, surface, ast_model)
-    attach_semantic_accounting_info(rec, sem_reasons, sem_high)
-
-    # 4. Lower AST -> real CAFA-Linear-IR.
     try:
-        linear_ir = lower_ast_to_linear_ir(ast_model)
-    except Exception as e:
-        rec["status"], rec["error"] = "compile_fail", f"AST lowering failed: {e}"
-        attach_suspicious_info(rec, rec.get("suspicious_reasons", []) + [f"compiler_status_suspicious:ast_lowering_failed: {e}"])
-        attach_semantic_accounting_info(rec, rec.get("semantic_reasons", []) + [f"semantic:ast_lowering_failed:{e}"], rec.get("semantic_high_risk_reasons", []) + [f"semantic:ast_lowering_failed:{e}"])
-        return rec
-
-    rec["ir"] = linear_ir
-
-    if ir_path:
-        os.makedirs(os.path.dirname(ir_path), exist_ok=True)
-        with open(ir_path, "w", encoding="utf-8") as f:
-            json.dump(linear_ir, f, indent=2, ensure_ascii=False)
-    if ast_path:
-        os.makedirs(os.path.dirname(ast_path), exist_ok=True)
-        with open(ast_path, "w", encoding="utf-8") as f:
-            json.dump(ast_model, f, indent=2, ensure_ascii=False)
-
-    # 5. deterministic Linear-IR -> Gurobi backend compiler.
-    try:
-        code = compile_linear_ir_to_gurobi(linear_ir, save_path=code_path)
-    except Exception as e:
-        rec["status"], rec["error"] = "compile_fail", str(e)
-        extra = [f"compiler_status_suspicious:compile_fail: {e}"]
-        attach_suspicious_info(rec, rec.get("suspicious_reasons", []) + extra)
-        attach_semantic_accounting_info(rec, rec.get("semantic_reasons", []) + [f"semantic:compile_fail:{e}"], rec.get("semantic_high_risk_reasons", []) + [f"semantic:compile_fail:{e}"])
-        return rec
-
-    rec["code_used"] = code
-
-    # 6. execute compiled code
-    res = execute_code(code, save_path=code_path)
-    rec.update(status=res["status"], obj_val=res["obj_val"], error=res["error"])
-    attach_suspicious_info(rec, analyze_suspicious_case(description, surface, result=res))
-    sem_reasons, sem_high = semantic_accounting_checks(description, surface, ast_model, result=res)
-    attach_semantic_accounting_info(rec, sem_reasons, sem_high)
-
-    # 7. optional verifier: now gated by HIGH-RISK semantic accounting failures.
-    if enable_verifier and needs_semantic_verification(res, rec):
-        revised = verify(
-            description, surface, res, model=model,
-            backend=backend, api_url=api_url, api_key=api_key,
-            json_mode=json_mode, timeout=timeout, max_retries=max_retries,
-            semantic_report={
-                "semantic_reasons": rec.get("semantic_reasons", []),
-                "semantic_high_risk_reasons": rec.get("semantic_high_risk_reasons", []),
-                "suspicious_reasons": rec.get("suspicious_reasons", []),
-                # CAFA-SEMANTIC-BINDING-PATCH START
-                "semantic_repair_reasons": rec.get("semantic_repair_reasons", []),
-                # CAFA-SEMANTIC-BINDING-PATCH END
-            },
+        revised_ast, revised_ir, revised_code, revised_result = compile_surface_pipeline(
+            revised, code_path, ir_path, ast_path
         )
-        if revised:
-            try:
-                revised_ast = build_cafa_ast(revised)
-                revised_ir = lower_ast_to_linear_ir(revised_ast)
-                revised_code = compile_linear_ir_to_gurobi(revised_ir, save_path=code_path)
-                res2 = execute_code(revised_code, save_path=code_path)
-            except Exception:
-                revised_ast, revised_ir, revised_code, res2 = None, None, None, {"status": "compile_fail", "obj_val": None, "error": "revised compile failed"}
-            better = res2["status"] == "ok" and (
-                res["status"] != "ok"
-                or abs(res2["obj_val"] - ground_truth) < abs((res["obj_val"] or 0.0) - ground_truth)
-            )
-            if better:
-                rec["surface"] = revised
-                rec["formulation"] = revised
-                rec["ir"] = revised_ir
-                rec["ast"] = revised_ast
-                rec["code_hint"] = revised.get("code_hint")
-                rec["code_used"] = revised_code
-                rec.update(status=res2["status"], obj_val=res2["obj_val"], error=res2["error"])
-                attach_suspicious_info(rec, analyze_suspicious_case(description, revised, result=res2))
-                sem_reasons, sem_high = semantic_accounting_checks(description, revised, revised_ast, result=res2)
-                attach_semantic_accounting_info(rec, sem_reasons, sem_high)
-                if ir_path:
-                    with open(ir_path, "w", encoding="utf-8") as f:
-                        json.dump(revised_ir, f, indent=2, ensure_ascii=False)
-                if ast_path:
-                    with open(ast_path, "w", encoding="utf-8") as f:
-                        json.dump(revised_ast, f, indent=2, ensure_ascii=False)
-                rec["revised"] = True
+    except Exception:
+        return rec
+
+    if result_is_better(revised_result, result, ground_truth):
+        accept_solution(rec, revised, revised_ast, revised_ir, revised_code, revised_result)
+        refresh_analysis(rec, description, revised, revised_ast, result=revised_result)
+        rec["revised"] = True
+
     return rec
 
 
@@ -2232,8 +2239,34 @@ def solve(
 # Metrics
 # --------------------------------------------------------------------------- #
 
-def is_correct(obj_val: Optional[float], gt: float, tol: float) -> bool:
-    if obj_val is None:
+def parse_benchmark_answer(data: dict) -> Optional[float]:
+    """Parse benchmark answer/ground_truth while preserving null as None.
+
+    CAFA-INFEASIBLE-CHANGE:
+    NL4OPT-style benchmark files may use JSON null to denote that the problem
+    is infeasible.  Do not cast this value with float(); keep it as None.
+    """
+    raw = data.get("answer", data.get("ground_truth"))
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in {"", "null", "none", "nan"}:
+            return None
+    return float(raw)
+
+
+def is_correct(status: str, obj_val: Optional[float], gt: Optional[float], tol: float) -> bool:
+    """Check correctness for both numeric and infeasible/null targets.
+
+    CAFA-INFEASIBLE-CHANGE:
+    - numeric ground truth: require solver status `ok` and objective match.
+    - null/None ground truth: require solver status `infeasible`; the predicted
+      answer is interpreted as null.
+    """
+    if gt is None:
+        return status == "infeasible"
+    if status != "ok" or obj_val is None:
         return False
     if float(gt) == 0:
         return abs(float(obj_val) - float(gt)) <= max(tol, 1e-3)
@@ -2253,19 +2286,36 @@ def aggregate(records: list[dict], tol: float) -> dict:
         "llm_fail": 0,
     }
     correct, revised, correct_ids = 0, 0, []
+    wrong_answer, null_ground_truth, correct_infeasible = 0, 0, 0
     suspicious, suspicious_correct, suspicious_wrong = 0, 0, 0
     suspicious_ids: list[int] = []
     semantic_high_risk, semantic_high_risk_correct, semantic_high_risk_wrong = 0, 0, 0
     semantic_high_risk_ids: list[int] = []
 
+    terminal_statuses = {"ok", "infeasible", "unbounded", "solver_other"}
+    answer_like_statuses = {"ok", "infeasible", "unbounded"}
+
     for i, r in enumerate(records):
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        status = r.get("status")
+        counts[status] = counts.get(status, 0) + 1
         if r.get("revised"):
             revised += 1
-        is_ok_correct = r["status"] == "ok" and is_correct(r["obj_val"], r["ground_truth"], tol)
+
+        gt = r.get("ground_truth")
+        if gt is None:
+            null_ground_truth += 1
+
+        is_ok_correct = is_correct(status, r.get("obj_val"), gt, tol)
         if is_ok_correct:
             correct += 1
             correct_ids.append(i)
+            if gt is None and status == "infeasible":
+                correct_infeasible += 1
+        elif status in answer_like_statuses:
+            # A solver terminal answer was produced, but it does not match the
+            # benchmark target.  This includes feasible numeric answers for a
+            # null target and infeasible/unbounded statuses for numeric targets.
+            wrong_answer += 1
 
         if r.get("suspicious"):
             suspicious += 1
@@ -2283,13 +2333,19 @@ def aggregate(records: list[dict], tol: float) -> dict:
             else:
                 semantic_high_risk_wrong += 1
 
+    terminal = sum(counts.get(k, 0) for k in terminal_statuses)
+
     return {
         "total": n,
         "success_rate": counts["ok"] / max(n, 1),
+        "terminal_rate": terminal / max(n, 1),
         "accuracy": correct / max(n, 1),
         "success": counts["ok"],
+        "terminal": terminal,
         "correct": correct,
-        "wrong_answer": counts["ok"] - correct,
+        "wrong_answer": wrong_answer,
+        "null_ground_truth": null_ground_truth,
+        "correct_infeasible": correct_infeasible,
         "parse_fail": counts["parse_fail"],
         "compile_fail": counts["compile_fail"],
         "exec_fail": counts["exec_fail"],
@@ -2318,9 +2374,12 @@ def print_report(s: dict) -> None:
     tol_text = f"{tol:.2%}" if tol >= 0.001 else f"{tol:g} relative/absolute"
     print("=" * 60)
     print(f"Total          : {s['total']}")
-    print(f"Success rate   : {s['success']}/{n} = {s['success_rate']:.2%}  (IR parsed + compiled + executed)")
-    print(f"Accuracy       : {s['correct']}/{n} = {s['accuracy']:.2%}  (within {tol_text} of GT)")
+    print(f"Optimal status : {s['success']}/{n} = {s['success_rate']:.2%}  (solver status OPTIMAL)")
+    print(f"Terminal status: {s.get('terminal', s['success'])}/{n} = {s.get('terminal_rate', s['success_rate']):.2%}  (OPTIMAL/INFEASIBLE/UNBOUNDED/OTHER)")
+    print(f"Accuracy       : {s['correct']}/{n} = {s['accuracy']:.2%}  (numeric within {tol_text}; null GT expects INFEASIBLE)")
     print(f"  wrong_answer : {s['wrong_answer']}")
+    print(f"  null_gt      : {s.get('null_ground_truth', 0)}")
+    print(f"  correct_null : {s.get('correct_infeasible', 0)}")
     print(f"  parse_fail   : {s['parse_fail']}")
     print(f"  compile_fail : {s['compile_fail']}")
     print(f"  exec_fail    : {s['exec_fail']}")
@@ -2350,22 +2409,19 @@ def safe_path_name(name: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
-    p.add_argument("--model", default="qwen3-4b-instruct-2507")
+    p.add_argument("--model", default="qwen3.5-4b")
     p.add_argument("--output_dir", default="outputs_ir_lite")
     p.add_argument("--enable_verifier", action="store_true", default=True)
     p.add_argument("--no_verifier", dest="enable_verifier", action="store_false")  # legacy flag
     p.add_argument("--tolerance", type=float, default=0.05)
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--overwrite", action="store_true", help="Re-run even if meta.json already exists.")
-
-    # CAFA-LMSTUDIO-CHANGE START
     p.add_argument("--backend", choices=["openai", "lmstudio"], default=os.getenv("CAFA_BACKEND", "lmstudio"))
     p.add_argument("--api_url", default=None, help="Override API base URL. For LM Studio: http://localhost:1234/v1.")
     p.add_argument("--api_key", default=None, help="Override API key. For LM Studio: lm-studio.")
     p.add_argument("--json_mode", choices=["auto", "none", "json_object", "json_schema"], default="auto")
     p.add_argument("--timeout", type=int, default=120)
     p.add_argument("--max_retries", type=int, default=3)
-    # CAFA-LMSTUDIO-CHANGE END
 
     args = p.parse_args()
 
@@ -2380,7 +2436,8 @@ def main() -> int:
     records: list[dict] = []
     for i, line in enumerate(lines):
         data = json.loads(line)
-        desc, gt = data["description"], float(data["answer"])
+        desc = data["description"]
+        gt = parse_benchmark_answer(data)
         pdir = os.path.join(base, f"problem_{i}")
         os.makedirs(pdir, exist_ok=True)
         meta_path = os.path.join(pdir, "meta.json")
@@ -2413,7 +2470,7 @@ def main() -> int:
         records.append(rec)
 
     summary = aggregate(records, tol=args.tolerance)
-    summary["workflow"] = "cafa++-pass2-evidence-bound-ast-accounting"
+    summary["workflow"] = "cafa++-pass2-evidence-bound-ast-accounting-null-infeasible"
     summary["model"] = args.model
     summary["backend"] = args.backend
     summary["verifier_enabled"] = args.enable_verifier

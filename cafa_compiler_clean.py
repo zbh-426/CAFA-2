@@ -2329,7 +2329,7 @@ def safe_path_name(name: str) -> str:
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True)
-    p.add_argument("--model", default="qwen3.5-4b")
+    p.add_argument("--model", default="qwen3-4b-instruct-2507")
     p.add_argument("--output_dir", default="cafa2_outputs")
     p.add_argument("--enable_verifier", action="store_true", default=True)
     p.add_argument("--no_verifier", dest="enable_verifier", action="store_false")  # legacy flag
